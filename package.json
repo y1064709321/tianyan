@@ -1,0 +1,55 @@
+{
+  "name": "tianyan",
+  "version": "0.0.1",
+  "type": "module",
+  "description": "多Agent协同长篇小说创作系统 — TypeScript纯TS实现，7 Agent · 44工具",
+  "scripts": {
+    "prestart": "",
+    "start": "node bin/tianyan.js",
+    "dev": "tsc && node bin/tianyan.js",
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "postinstall": "node scripts/install-scrapling.js"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.8.0",
+    "better-sqlite3": "^13.0.3",
+    "hono": "^4.0.0",
+    "yaml": "^2.4.0",
+    "playwright": "^1.63.0",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "LICENSE",
+    "README.md",
+    "bin/",
+    "config.example.yaml",
+    "dist/",
+    "na",
+    "na.bat",
+    "scripts/",
+    "src/",
+    "start.bat",
+    "start.sh",
+    "tianyan.bat",
+    "tianyan.sh",
+    "tsconfig.json",
+    "web/",
+    "scrapling/",
+    "install.sh",
+    "install.bat",
+    "NOTICE"
+  ],
+  "bin": {
+    "tianyan": "bin/tianyan.js"
+  }
+}

@@ -1,0 +1,66 @@
+# 天衍 配置文件示例
+# 默认无内置密钥，首次使用须配置:
+#   1) 交互式启动时选择「不跳过」输入密钥
+#   2) 或启动后在前端「模型配置」界面填写
+#   3) 或用 CLI 参数: tianyan --api-key sk-xxx
+#   4) 或设置环境变量: TIANYAN_API_KEY=sk-xxx
+# 无需手动编辑本文件。
+
+data_dir: ~/.tianyan
+server_host: 0.0.0.0
+server_port: 8000
+
+max_steps: 8
+chunk_size: 2000
+chunk_overlap: 200
+retrieve_k: 6
+
+# 默认模型 (agent 实际使用的模型, litellm 前缀格式)
+# 2026-10-17: 默认为 DeepSeek。deepseek-flash 为官方现行规范 ID (DeepSeek-V4.1-Flash)。
+# 注意: 需在下方 api_key 填入 DeepSeek 密钥, 或设置环境变量 DEEPSEEK_API_KEY / TIANYAN_API_KEY;
+# 若你之前用环境变量 TIANYAN_API_KEY 存的是 Agnes 的 key, 它会被发给 DeepSeek 导致 401,
+# 此时请改为在这里直接填 api_key (或在「模型配置」界面给 deepseek 单独配 key)。
+default_model:
+  model: deepseek/deepseek-flash
+  api_key: ""
+  api_base: "https://api.deepseek.com/v1"
+  temperature: 0.8
+  max_tokens: 4096
+
+# 预设模型列表 (前端「添加模型」可快捷选,也可自行增删)
+# 2026-10-17 核实更新: 删除已停服/退役的模型 (yi 全线公共 API 关停、kimi-k2.5、ernie-4.0 系、
+# mimo-v2.5 系、deepseek 的 v3.1/r1 API 别名), 补充各厂最新型号
+models:
+  - model: deepseek/deepseek-flash
+    api_key: ""
+    api_base: "https://api.deepseek.com/v1"
+  - model: deepseek/deepseek-v4-pro
+    api_base: "https://api.deepseek.com/v1"
+  - model: agnes/agnes-2.5-flash
+    api_base: "https://apihub.agnes-ai.com/v1"
+  - model: agnes/agnes-2.5-pro
+    api_base: "https://apihub.agnes-ai.com/v1"
+  - model: openai/gpt-6.1-sol
+  - model: openai/gpt-6-luna
+  - model: gemini/gemini-3.8-flash
+  - model: dashscope/qwen3.8-max
+  - model: zai/glm-5.3
+  - model: moonshot/kimi-k3
+  - model: moonshot/kimi-k2.7-code
+  - model: siliconflow/deepseek-ai/DeepSeek-V4.1-Flash
+  - model: ollama/qwen3.5:9b
+    api_base: http://localhost:11434
+  # 小米 MiMo (OpenAI 兼容, env: XIAOMI_API_KEY)
+  - model: openai/mimo-v2.6-pro
+    api_base: https://api.xiaomimimo.com/v1
+  # 华为盘古 MaaS (OpenAI 兼容, env: MAAS_API_KEY)
+  - model: openai/openpangu-2.0-flash
+    api_base: https://api.modelarts-maas.com/v2
+  # 百川智能 Baichuan
+  - model: baichuan/baichuan4-turbo
+  - model: baichuan/baichuan4-air
+  # 阶跃星辰 StepFun
+  - model: stepfun/step-5-preview
+  - model: stepfun/step-3.7-flash
+  # 腾讯混元 Hunyuan (旧版 turbos/t1/standard/large/lite 已停调, hy3-preview 已下线, 当前主力 hy3)
+  - model: hunyuan/hy3

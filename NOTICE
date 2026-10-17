@@ -1,0 +1,14 @@
+# 第三方组件归属 (Third-Party Notices)
+
+## Scrapling
+* 名称: Scrapling
+* 仓库: https://github.com/D4Vinci/Scrapling
+* 版本: 0.4.15 (2026-10, BSD 3-Clause 许可)
+* 协议: BSD 3-Clause "New" or "Revised" License
+* 版权: Copyright (c) 2024, Karim shoair
+* 用途: 天衍抓取侧车 (scrapling/server.py) 的底层抓取/反检测引擎
+       (curl_cffi TLS 指纹 + Camoufox 浏览器层)
+* 义务: 源码再分发时保留其版权声明 (本文件 + pip 包自带 LICENSE)
+
+本文件仅做归属声明, 不改变 Scrapling 自身协议; 天衍主项目仍为 AGPL-3.0,
+Scrapling 组件按 BSD-3-Clause 独立适用, 二者可共存 (AGPL 不会把 BSD 组件拖成 AGPL)。

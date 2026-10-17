@@ -1,0 +1,5 @@
+# 天衍抓取侧车 (Scrapling) — Python 依赖
+# 安装: pip install -r requirements.txt
+# 协议: BSD-3-Clause (Scrapling, Copyright 2024 Karim shoair)
+# 核心 (必装):
+scrapling[fetchers]>=0.4.15

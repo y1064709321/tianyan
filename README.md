@@ -90,7 +90,9 @@ Scrapling 通过 Python 侧车调用，无 Python 环境时自动降级为零依
 
 ```bash
 # 任何系统都可以用（无需浏览器）
-bash tianyan.sh           # 或 Windows: tianyan.bat
+tianyan.sh           
+# 或 Windows:
+ tianyan.bat
 # 启动后手动访问终端显示的地址: http://localhost:xxxx
 ```
 

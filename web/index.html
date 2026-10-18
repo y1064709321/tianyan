@@ -109,10 +109,20 @@
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
         </button>
         <textarea id="input" placeholder="输入指令…" rows="1"></textarea>
+        <!-- 语音输入: 直接调浏览器自带的语音识别 (Web Speech API), 识别结果实时填进输入框,
+             不发送 —— 说完检查一遍再发。Chrome/Edge 可用, 需要 localhost 或 https 环境。 -->
+        <button class="composer-icon-btn" id="voice-btn" title="语音输入 (点击开始, 再点停止)">
+          <svg id="voice-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v1a7 7 0 0 1-14 0v-1"/><line x1="12" y1="18" x2="12" y2="22"/></svg>
+        </button>
         <div class="slash-popup hidden" id="slash-popup"></div>
       </div>
+      <!-- 发送/停止二合一按钮:
+           空闲 = 纸飞机(发送); 任务跑着且输入框为空 = 方块(停止, 真停后端 run);
+           输入框里有字 = 仍是发送(发送时会先停掉上一个任务)。
+           以前"想中断只能刷新页面", 而刷新只断前端连接, 后端 run 还在继续烧 token。 -->
       <button class="composer-send" id="send-btn" title="发送">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+        <svg id="send-icon-plane" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+        <svg id="send-icon-stop" class="hidden" width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
       </button>
     </div>
     <div class="composer-bottom-row">

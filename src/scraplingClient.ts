@@ -2,13 +2,34 @@
 // 设计: spawn 子进程 (python3 scrapling/server.py --once), stdin 传 JSON, stdout 收 JSON.
 // 无 Python/scrapling 时自动降级为 Node 纯 fetch (与 browserService.ts fetch-only 层对齐).
 import { spawn, execSync } from "node:child_process";
-import { existsSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { existsSync, readdirSync } from "node:fs";
+import { join, dirname, delimiter } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(here, "..");
 const SERVER_PY = join(ROOT, "scrapling", "server.py");
+
+// Scrapling 包所在目录 (pip install --target 装的):
+// Windows: .venv-scrapling/Lib/site-packages ; POSIX: .venv-scrapling/lib/python3.x/site-packages
+// 之所以用 --target 而不是 venv 里的 python: venv 的 pyvenv.cfg 在含非 ASCII 路径的机器上会被
+// Python 以 ANSI 编码读取失败 (报错 "failed to open pyvenv.cfg"), 整个 venv 变废。
+// 现在统一用能跑的 python + PYTHONPATH 指到包目录, 不依赖 venv 解释器本身。
+function scraplingSiteDirs(): string[] {
+  const venv = join(ROOT, ".venv-scrapling");
+  const win = join(venv, "Lib", "site-packages");
+  const dirs = [win];
+  const libDir = join(venv, "lib");
+  if (!process.platform.startsWith("win") && existsSync(libDir)) {
+    try {
+      for (const d of readdirSync(libDir)) {
+        const sp = join(libDir, d, "site-packages");
+        if (existsSync(sp)) dirs.push(sp);
+      }
+    } catch { /* ignore */ }
+  }
+  return dirs.filter(existsSync);
+}
 
 export type ScraplingAction = "search" | "fetch" | "ranking" | "browser";
 
@@ -23,6 +44,15 @@ let pyCache: string | null | undefined;
 function findPython(): string | null {
   if (pyCache !== undefined) return pyCache;
   pyCache = null;
+  // 0. 环境变量优先 (机器上有多个 python / venv 解释器坏掉时的逃生口)
+  const envPy = process.env.TIANYAN_SCRAPLING_PY;
+  if (envPy) {
+    try {
+      execSync(`"${envPy}" --version`, { timeout: 5000, stdio: "pipe" });
+      pyCache = envPy;
+      return pyCache;
+    } catch { /* 回退到自动查找 */ }
+  }
   // 1. 系统 python3/python
   for (const cmd of ["python3", "python"]) {
     try {
@@ -77,7 +107,14 @@ export function callScrapling<T = Record<string, unknown>>(
       );
       return;
     }
-    const child = spawn(py, [SERVER_PY, "--once"], { cwd: ROOT, stdio: ["pipe", "pipe", "pipe"] });
+    // PYTHONPATH: 让"能跑的 python"找到 --target 安装的 scrapling
+    const siteDirs = scraplingSiteDirs();
+    const extra = [process.env.PYTHONPATH, ...siteDirs].filter(Boolean).join(delimiter);
+    const child = spawn(py, [SERVER_PY, "--once"], {
+      cwd: ROOT,
+      stdio: ["pipe", "pipe", "pipe"],
+      env: extra ? { ...process.env, PYTHONPATH: extra } : process.env,
+    });
     let stdout = "";
     let stderr = "";
     const timer = setTimeout(() => {

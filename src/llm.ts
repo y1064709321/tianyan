@@ -251,6 +251,8 @@ async function callWithRetry(
   let lastError: Error | null = null;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
+      // 每次尝试前都过一次闸门: 重试期间别的 agent 可能刚撞了 429
+      await awaitRateLimitGate(`callWithRetry#${attempt + 1}`);
       const resp = await callApi(cfg, body);
       if (resp.ok) {
         const data = await resp.json() as Record<string, unknown>;
@@ -294,7 +296,33 @@ export function _globalRateLimitState() {
   return { active: Date.now() < globalRateLimitUntil, remainingMs: Math.max(0, globalRateLimitUntil - Date.now()) };
 }
 export function _markGlobalRateLimit() {
+  // 冷却窗口 30s (实测免费档限流窗口约 15s, 30s 可完整跨过)。
+  // 【别再加长】冷却期内所有 LLM 调用都会挂起, 加长等于整条链路一起停摆。
   globalRateLimitUntil = Math.max(globalRateLimitUntil, Date.now() + 30_000);
+}
+
+/** 闸门单次最多等这么久 —— 防御性上限, 防止异常时间戳把调用永久挂死 */
+const RATE_LIMIT_MAX_WAIT_MS = 60_000;
+
+/**
+ * 全局 429 冷却闸门: 任一调用撞 429 后置位, 期间所有 LLM 调用先挂起等待,
+ * 避免多 agent 并发时全链路互相撞限流 (一个 agent 撞了 429, 其余还在猛打同一个 key)。
+ *
+ * 【单一数据源】chat / stream / callWithRetry 三个调用点统一走这里, 别各写一份。
+ * 历史上就是各写一份出的 bug: stream() 里那份把剩余时间算成了
+ *   `Date.now() - globalRateLimitUntil`  ← 减反了
+ * 后果是**完全反着工作**:
+ *   - 冷却期内 (Date.now() < until): rem 为负 → 不等 → 直接冲上去再撞一次 429
+ *   - 冷却结束后: rem 为正 = "已经过去多久" → 反而等, 而且**越晚调用等越久**
+ *     (冷却结束 10 分钟后再调用, 会白等 600 秒)。
+ * 这正是"回答一次之后就连不上 / 长任务跑不动"的一个真因。
+ */
+async function awaitRateLimitGate(where: string): Promise<void> {
+  const remaining = globalRateLimitUntil - Date.now();
+  if (remaining <= 0) return;
+  const wait = Math.min(remaining, RATE_LIMIT_MAX_WAIT_MS);
+  logInfo(`[限流闸门] ${where} 429 冷却中, 挂起等待 ${Math.round(wait / 1000)}s`);
+  await new Promise((r) => setTimeout(r, wait));
 }
 
 export async function chat(
@@ -304,6 +332,10 @@ export async function chat(
 ): Promise<LLMResponse> {
   const model = cfg || getSettings().defaultModel;
   const body = buildRequest(model, messages, opts);
+  // 非流式调用原先**完全不过冷却闸门** —— 只有 stream 有。于是撞 429 后走非流式兜底的那些调用
+  // (runner 的 fallback 分支、testConnection、子 agent 快路径) 全部无视冷却猛打, 把刚冷却的
+  // 额度又打爆。这里补上。
+  await awaitRateLimitGate("chat");
   return callWithRetry(model, body);
 }
 
@@ -326,13 +358,8 @@ export async function* stream(
   cfg?: ModelConfig,
   opts: { temperature?: number; maxTokens?: number; stop?: string[]; tools?: ToolDefinition[] } = {},
 ): AsyncGenerator<string> {
-  // 全局 429 冷却闸门: 前一个调用刚撞 429 时, 本次先挂起等待 (多 agent 并发防互相撞限流)
-  {
-    const rem = Date.now() - globalRateLimitUntil;
-    if (rem > 0) {
-      await new Promise((r) => setTimeout(r, rem));
-    }
-  }
+  // 全局 429 冷却闸门 (统一走 awaitRateLimitGate, 别在这里再手写一遍剩余时间计算)
+  await awaitRateLimitGate("stream");
   const model = cfg || getSettings().defaultModel;
   const body = buildRequest(model, messages, { ...opts, stream: true });
   // ===== 诊断日志 (定位大上下文下 0-chunk / 快失败的真因): 每次调用记 消息数+字节数, 结果记 chunk 数+首 chunk 延迟+异常 =====

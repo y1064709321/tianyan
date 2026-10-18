@@ -26,10 +26,11 @@ function findPython() {
 }
 
 // Scrapling 硬限制: requires-python >=3.10 (PyPI metadata, v0.4.15). 3.8/3.9 直接跳过.
+// 版本检查用【双引号】包住 -c 参数: Windows 的 cmd.exe 不认单引号, 单引号版会失败并被当成"探测不到版本"。
 function checkPythonVersion(py) {
   let out = "";
   try {
-    out = execSync(`${py} -c 'import sys; print("%d.%d" % sys.version_info[:2])'`, {
+    out = execSync(`${py} -c "import sys; print('%d.%d' % sys.version_info[:2])"`, {
       stdio: "pipe", timeout: 5000,
     }).toString().trim();
   } catch { out = ""; }
@@ -46,7 +47,12 @@ if (process.env.TIAN_YAN_SKIP_SCRAPLING === "1") {
 }
 if (!existsSync(reqs)) { console.log("⚠ scrapling/requirements.txt 缺失, 跳过"); process.exit(0); }
 
-const py = findPython();
+const { PYTHONPATH, TIANYAN_SCRAPLING_PY, ...cleanEnv } = process.env;
+const py = process.env.TIANYAN_SCRAPLING_PY || findPython();
+// 包安装目录 (pip --target): Windows → Lib\site-packages; POSIX → lib/python3.x/site-packages
+const siteDir = process.platform === "win32"
+  ? join(venvDir, "Lib", "site-packages")
+  : join(venvDir, "lib", "python", "site-packages");
 if (!py) {
   console.log("⚠ 未找到 python3/python — Scrapling 侧车跳过 (抓取自动降级 dom-sim/纯 fetch). 装好 Python (≥3.10) 后重跑: node scripts/install-scrapling.js");
   process.exit(0);
@@ -57,22 +63,43 @@ if (ver && !ver.ok) {
   process.exit(0);
 }
 
+// 真实可用性校验: marker 只能证明"曾经装过", 证明不了"现在还能用" ——
+// 目录被清 / --target 半途失败 / python 换了版本, 都会出现 marker 在、包不在的情况,
+// 而旧逻辑只认 marker → 一键脚本跳过安装 → 用户看到的就是"抓取压根没启用"。
+// 所以统一以 `import scrapling` 为准, marker 只是加速用的提示。
+function scraplingImportable(py, dir) {
+  // 必须探 symbols, 不能只 import scrapling: 项目根目录自己就有个 scrapling/ 目录
+  // (侧车源码), CWD=项目根时它会被当成 namespace package 导入成功 (__file__=None),
+  // 于是"包其实没装"也被误判成已装好。
+  try {
+    execSync(`"${py}" -c "import scrapling, sys; sys.exit(0 if (getattr(scrapling,'__file__',None) and hasattr(scrapling,'Fetcher')) else 1)"`, {
+      stdio: "pipe",
+      timeout: 30_000,
+      env: { ...cleanEnv, PYTHONPATH: [dir, cleanEnv.PYTHONPATH].filter(Boolean).join(process.platform === "win32" ? ";" : ":") },
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 try {
-  // 已装好 → 直接返回 (幂等)
-  if (existsSync(marker)) {
-    console.log("✓ Scrapling 侧车已安装 (marker 存在), 跳过. 重装: rm .venv-scrapling/.scrapling-installed && node scripts/install-scrapling.js");
+  if (existsSync(marker) && scraplingImportable(py, siteDir)) {
+    console.log("✓ Scrapling 侧车已就绪 (import 校验通过), 跳过安装. 强制重装: rm .venv-scrapling/.scrapling-installed");
     process.exit(0);
   }
-  mkdirSync(venvDir, { recursive: true });
-  console.log("↓ 一键安装 Scrapling 抓取侧车 (python venv + pip, 可能 1~2 分钟)...");
-  sh(`${py} -m venv "${venvDir}"`);
-  const pip = join(venvDir, process.platform === "win32" ? "Scripts\\pip.exe" : "bin/pip");
-  const pipArg = process.platform === "win32" ? `"${pip}"` : `"${pip}"`;
-  sh(`${pipArg} install --upgrade pip`, { cwd: root });
+  if (existsSync(marker)) console.log("! marker 存在但 import scrapling 失败 → 实际未装好, 重新安装…");
+  mkdirSync(siteDir, { recursive: true });
+  // 注意: 不再用 venv 解释器 (pyvenv.cfg 在含非 ASCII 路径的机器上会被 Python 以 ANSI 编码
+  // 读取失败 → 整个 venv 报废)。改为: 能跑的 python + pip install --target, 由
+  // src/scraplingClient.ts 通过 PYTHONPATH 指到这个目录。
+  console.log("↓ 一键安装 Scrapling 抓取侧车 (pip --target, 可能 1~3 分钟)...");
 
   // ── 国内 PyPI 镜像源自动轮换：哪个源能下通就用哪个, 逐个试 ──
-  // 顺序: 清华 → 阿里云 → 华为云 → 腾讯云 → 官方 (最后兜底). 某源 15s 超时即换下一个.
+  // 顺序: 清华 → 阿里云 → 华为云 → 腾讯云 → 官方 (最后兜底). 某源超时即换下一个.
+  // 实测本地清华源常被代理 502, 阿里云通得快 → 阿里云排第一再逐个降级.
   const pipMirrors = [
+    ["阿里云", "https://mirrors.aliyun.com/pypi/simple/"],
     ["清华", "https://pypi.tuna.tsinghua.edu.cn/simple"],
     ["阿里云", "https://mirrors.aliyun.com/pypi/simple/"],
     ["华为云", "https://repo.huaweicloud.com/repository/pypi/simple/"],
@@ -83,8 +110,8 @@ try {
   for (const [name, url] of pipMirrors) {
     console.log(`  ⟳ 尝试 pip 源: ${name} (${url}) ...`);
     try {
-      sh(`${pipArg} install -i "${url}" -r "${reqs}"`, { cwd: root });
-      console.log(`  ✓ pip 源 ${name} 安装成功`);
+      sh(`"${py}" -m pip install --target "${siteDir}" -i "${url}" -r "${reqs}"`, { cwd: root, env: cleanEnv, timeout: 600000 });
+      console.log(`  ✓ pip 源 ${name} 安装成功 → ${siteDir}`);
       pipOk = true;
       break;
     } catch (e) {
@@ -95,8 +122,12 @@ try {
     throw new Error("所有 pip 镜像源 (清华/阿里云/华为云/腾讯云/官方) 均失败");
   }
 
+  // 安装完必须复验: 只有真能 import 才写 marker (避免"装了一半也打上已装标记")
+  if (!scraplingImportable(py, siteDir)) {
+    throw new Error("pip 报告成功但 import scrapling 仍失败 (--target 目录可能不完整)");
+  }
   writeFileSync(marker, new Date().toISOString() + "\n");
-  console.log("✓ Scrapling 侧车安装完成. 抓取模块自动启用 (curl_cffi 指纹 + Camoufox 浏览器层可选).");
+  console.log("✓ Scrapling 侧车安装完成并通过 import 校验. 抓取模块自动启用 (curl_cffi 指纹 + Camoufox 浏览器层可选).");
 } catch (e) {
   // 不阻断 npm install — 降级说明即可
   console.log("⚠ Scrapling 安装失败 (不阻断启动, 抓取自动降级 dom-sim/纯 fetch): " + String(e.message || e).slice(0, 160));

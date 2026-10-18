@@ -95,10 +95,13 @@ function initConfig() {
     const examplePath = join(root, "config.example.yaml");
     if (existsSync(examplePath)) {
       let cfg = readFileSync(examplePath, "utf-8");
-      cfg = cfg.replace(/data_dir:\s*~\/\.tianyan/, `data_dir: "${confDir}"`);
+      // 【致命坑】绝不能用双引号写 Windows 路径: data_dir: "C:\Users\xxx" 里的 \U / \l 是
+      // 非法 YAML 转义 → 下次启动 parse 抛错 → 整个配置被静默重置 (模型池/端口/密钥全丢)。
+      // 单引号标量不解析转义, 安全。
+      cfg = cfg.replace(/data_dir:\s*~\/\.tianyan/, `data_dir: '${confDir}'`);
       writeFileSync(confFile, cfg, "utf-8");
     } else {
-      writeFileSync(confFile, `data_dir: "${confDir}"
+      writeFileSync(confFile, `data_dir: '${confDir}'
 server_port: 8000
 
 default_model:
@@ -232,14 +235,30 @@ async function interactiveWizard() {
   }
 }
 
+// ---- 读取已有配置里的 server_port ----
+// 旧逻辑: -y / 非 TTY 启动时不看配置, 直接 8000 + random(1001) → 用户自己配的端口(如 8375)
+//         每次启动都被无视并跳到一个随机端口, 前端书签/断线重连全部失效。
+// 现在: 配置文件有 port 就用它, 只有没有才随机; CLI --port 与 TIANYAN_PORT 优先级仍最高。
+function confServerPort() {
+  try {
+    if (!existsSync(confFile)) return 0;
+    const raw = readFileSync(confFile, "utf-8");
+    const m = raw.match(/^[ \t]*server_port:[ \t]*(\d+)[ \t]*$/m);
+    return m ? Number(m[1]) : 0;
+  } catch {
+    return 0;
+  }
+}
+
 // ---- 启动服务 ----
 async function main() {
   const firstRun = initConfig();
 
   // CLI 参数优先级最高: 有参数时跳过交互
   const hasFlags = flags.apiKey || flags.model || flags.port || flags.skip || flags.noBrowser;
+  const filePort = confServerPort();
   if (hasFlags) {
-    const port = flags.port || Number(process.env.TIANYAN_PORT) || Number(process.env.TIANYAN_PORT) || 8000 + Math.floor(Math.random() * 1001);
+    const port = flags.port || Number(process.env.TIANYAN_PORT) || filePort || 8000 + Math.floor(Math.random() * 1001);
     const env = { ...process.env, TIANYAN_PORT: String(port) };
     if (flags.apiKey) env.TIANYAN_API_KEY = flags.apiKey;
     if (flags.model)  env.TIANYAN_MODEL = flags.model;
@@ -249,7 +268,7 @@ async function main() {
 
   // 无参数 + 非 TTY (管道/脚本模式) → 用默认配置启动，不弹引导
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    const port = Number(process.env.TIANYAN_PORT) || 8000 + Math.floor(Math.random() * 1001);
+    const port = Number(process.env.TIANYAN_PORT) || filePort || 8000 + Math.floor(Math.random() * 1001);
     const env = { ...process.env, TIANYAN_PORT: String(port) };
     await startService(env, port, true);
     return;

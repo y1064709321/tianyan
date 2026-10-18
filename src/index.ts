@@ -17,6 +17,7 @@ import type { Phase } from "./workflow.js";
 import { BUILTIN_SKILLS, isBuiltinEnabled, setBuiltinEnabled, listCustomSkills, addCustomSkill, removeCustomSkill, setCustomSkillEnabled, getAgentSkillPrompts } from "./skills.js";
 import { getMeta, isValid, isReadonly, AGENT_TOOLS, getMaxDelegateDepth, DEFAULT_AGENT, AGENT_META, getAgentPrompt, WORKFLOW_PHASES } from "./agents/index.js";
 import type { SSEEvent, AgentName } from "./types.js";
+import { cancelRun, clearRunCancel } from "./runCancel.js";
 import { existsSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -297,6 +298,23 @@ app.delete("/api/runs/:runId", (c) => {
   return c.json({ ok: true });
 });
 
+/**
+ * 停止正在执行的 run。
+ * 前端点「停止」时调这个 —— 光是断开 SSE 没用, 后端那个 run 还会继续跑完(继续烧 token)。
+ * 这里标记后, runner 主循环 / 流式 chunk 循环会协作式退出并 finishRun(status="cancelled")。
+ */
+app.post("/api/runs/:runId/cancel", (c) => {
+  const runId = c.req.param("runId");
+  const run = store.getRun(runId);
+  if (!run) return c.json({ error: "run 不存在" }, 404);
+  if (run.status !== "running") {
+    return c.json({ ok: true, alreadyFinished: true, status: run.status });
+  }
+  cancelRun(runId);
+  logInfo(`[停止] 用户取消 run=${runId} pid=${run.projectId}`);
+  return c.json({ ok: true, cancelled: true });
+});
+
 // ===== Metrics =====
 app.get("/api/projects/:pid/metrics", (c) => {
   const db = store.getDb();
@@ -530,8 +548,8 @@ async function runFastPathExpert(
   pid: string, runId: string, agent: string, task: string, userInput: string,
   coreTool: string, coreArgs: Record<string, unknown>, intentLabel: string,
   send: (evt: SSEEvent) => void,
-): Promise<string> {
-  const { dispatchTool, finalReviewDeliverable } = await import("./agents/runner.js");
+): Promise<{ content: string; approved: boolean }> {
+  const { dispatchTool, finalReviewDeliverable, finalReviewWithRework } = await import("./agents/runner.js");
   const { getAgentPrompt, AGENT_TOOLS } = await import("./agents/index.js");
   const { getAgentSkillPrompts } = await import("./skills.js");
   const proj = store.getProject(pid);
@@ -551,30 +569,48 @@ async function runFastPathExpert(
   const { runAgentLoop } = await import("./agents/runner.js");
   const subT0 = Date.now();
   const subSendGate = { canceled: false };
+  // 记录专家到底调没调工具 — 光有文本不够: 实测 agnes 会只回一句"我来执行扫榜任务"就收尾,
+  // 旧逻辑 llmResult 非空就算成功 → 交付一句空话, 长任务第 1 步就 done 了。
+  const subToolsUsed = new Set<string>();
   const subSend: typeof send = (evt) => {
     if (subSendGate.canceled) return; // 主流程已收尾, 吞掉子 loop 后续事件 (修悬挂)
+    const t = (evt as { tool?: string }).tool;
+    if ((evt.type === "step" || evt.type === "observation") && t) subToolsUsed.add(t);
     send(evt);
   };
   const loopPromise = runAgentLoop({ pid, agentName: agent as AgentName, messages: subMsgs, depth: 1, runId, delegationLog: [], emit: subSend });
-  const EXPERT_LLM_BUDGET_MS = 15_000;
+  // 旧值 15s 对"调工具 + 基于结果写汇报"的多回合任务根本不够 (往往第 1 回合才刚说完话就到点),
+  // 放宽到 60s。再放宽到 90s 是因为: 这个 race 的另一端也包括**核心工具代跑**,
+  // 而扫榜现在多了真实浏览器层 (破 WAF 那一层), 8 平台串行+并发压下来实测要 60~70s,
+  // 60s 预算会把它硬切掉 → 专家"没交付" → 降级到 web_search 搜出一堆不相关的东西。
+  const EXPERT_LLM_BUDGET_MS = Number(process.env.TIANYAN_EXPERT_LLM_BUDGET_MS) || 90_000;
   const timeoutPromise = new Promise<string>((resolve) => setTimeout(() => resolve(""), EXPERT_LLM_BUDGET_MS));
   const llmResult = await Promise.race([loopPromise, timeoutPromise]);
-  // 确定性核心工具代跑 — 【仅超时降级】: 专家 LLM 在预算内没出结果 (429/卡死) 才由代码层代跑,
+  const expertText = llmResult.trim();
+  // 【够不够格check】: 有文本 + 真的用过工具, 才算专家自跑成功。
+  // chat 类任务没有 coreTool, 此时只要非空就用它的文本。
+  const expertDelivered = expertText.length > 0 && (subToolsUsed.size > 0 || !coreTool);
+  // 确定性核心工具代跑 — 【仅降级补齐】: 专家超时 / 没出结果 / 只出空话没真调工具 才由代码层跑,
   // 保证"扫榜就是真扫榜"的底线。正常情况下工具由专家自己调, 代码不抢活。
   let toolResult = "";
-  if (!llmResult.trim() && coreTool) {
+  if (!expertDelivered && coreTool) {
     try {
       toolResult = await dispatchTool(pid, coreTool, coreArgs, agent as AgentName);
-      logInfo(`[快路径B-2] ${agent} LLM 超时降级, 核心工具 ${coreTool} 代跑成功 ${toolResult.length} 字`);
+      logInfo(`[快路径B-2] ${agent} 专家未交付真实数据${expertText ? " (只回了 "+expertText.length+" 字空话)" : " (超时)"}, 核心工具 ${coreTool} 代跑成功 ${toolResult.length} 字`);
     } catch (e) {
       toolResult = `${intentLabel}失败: ${(e as Error).message?.slice(0, 120)}`;
       logWarn(`[快路径B-2] ${agent} 核心工具 ${coreTool} 代跑失败: ${(e as Error).message?.slice(0, 100)}`);
     }
   }
   let deliverable: string;
-  if (llmResult.trim()) {
-    deliverable = "【专家汇报 (它自己的推理 + 它自己调的工具)】\n" + llmResult;
-    logInfo(`[快路径B-2] ${agent} 自跑loop出结果 ${llmResult.length} 字 (${Date.now() - subT0}ms)`);
+  if (expertDelivered) {
+    deliverable = "【专家汇报 (它自己的推理 + 它自己调的工具)】\n" + expertText;
+    logInfo(`[快路径B-2] ${agent} 自跑loop出结果 ${expertText.length} 字 (${Date.now() - subT0}ms, 工具: ${[...subToolsUsed].join(",") || "-"})`);
+  } else if (toolResult) {
+    deliverable = "【工具真实执行结果 (专家未调用工具, 代码层代跑补齐)】\n" + toolResult;
+  } else if (expertText) {
+    // 没有 coreTool 可代跑 (纯对话), 专家文本照样交付
+    deliverable = "【专家汇报】\n" + expertText;
   } else {
     deliverable = toolResult
       ? "【工具真实执行结果 (专家 LLM 超时, 代码层代跑)】\n" + toolResult
@@ -583,9 +619,31 @@ async function runFastPathExpert(
   }
   // 主流程已拿到 deliverable, 子 loop 后台 emit 从此被吞 (防悬挂)
   subSendGate.canceled = true;
-  // B-3 总编终审: 专家产出出门前总编读一遍 (背书或总编修订) — 终审用主 send (未被吞)
-  const final = await finalReviewDeliverable(pid, runId, agent as AgentName, intentLabel, deliverable, send);
-  return final.approved ? final.content : final.content + "\n\n[终审裁决: " + final.verdict.slice(0, 150) + "]";
+  // B-3 总编终审 + 返修闭环: 打回 → 带着修改指令让同一专家重跑一轮 → 再终审 (最多 1 轮)。
+  // 以前打回后裁决意见只附在文本末尾, 从未送回专家, run 直接结束 —— 用户看到"审完了没下文"。
+  const reworkOnce = async (feedback: string): Promise<string> => {
+    subSendGate.canceled = false; // 返修轮事件要放行
+    try {
+      const retryMsgs: Array<{ role: string; content: string }> = [...subMsgs];
+      if (expertText) retryMsgs.push({ role: "assistant", content: expertText.slice(0, 2000) });
+      retryMsgs.push({ role: "user", content: `【总编终审打回 · 返修指令】\n${feedback}\n\n这次必须真的调用你的工具产出完整成果 (任务: ${intentLabel})。严禁只回启动语, 严禁复述计划。` });
+      logInfo(`[终审返修] ${agent} 带修改指令重跑 (${intentLabel})`);
+      const retryText = await Promise.race([
+        runAgentLoop({ pid, agentName: agent as AgentName, messages: retryMsgs, depth: 1, runId, delegationLog: [], emit: subSend }),
+        new Promise<string>((resolve) => setTimeout(() => resolve(""), EXPERT_LLM_BUDGET_MS)),
+      ]);
+      if (!retryText.trim()) return "";
+      // 真实工具数据 (若有) 保留打底, 返修汇报接在后面
+      return toolResult ? "【工具真实执行结果】\n" + toolResult + "\n\n【返修汇报】\n" + retryText : "【返修汇报】\n" + retryText;
+    } finally {
+      subSendGate.canceled = true;
+    }
+  };
+  const final = await finalReviewWithRework(pid, runId, agent as AgentName, intentLabel, deliverable, send, reworkOnce, 1);
+  return {
+    content: final.approved ? final.content : final.content + "\n\n[终审裁决: " + final.verdict.slice(0, 150) + "]",
+    approved: final.approved,
+  };
 }
 
 // 共享 SSE 执行函数 (chat 和 run 共用)
@@ -603,6 +661,11 @@ function buildSseStream(pid: string, userInput: string, agentName: AgentName, se
         }
         if (!closed) { try { controller.enqueue(encoder.encode(`data: ${JSON.stringify(evt)}\n\n`)); } catch { closed = true; } }
       };
+      // 谁负责发 done: early-return 分支自己填好 payload, 由统一的收尾环节发出,
+      // 这样任何退出路径 (含 early return) 都保证有且只有一个 done。
+      let pendingDone: Record<string, unknown> | null = null;
+      let doneSent = false;
+      const finalSend = (evt: SSEEvent) => { if (evt.type === "done") doneSent = true; send(evt); };
       store.addMessage(pid, "user", userInput);
       const runId = store.createRun(pid, userInput, agentName);
       send({ type: "start", agent: agentName, input: userInput.slice(0, 200), runId });
@@ -662,11 +725,12 @@ function buildSseStream(pid: string, userInput: string, agentName: AgentName, se
             const scanRe = /扫榜|扫.*榜|榜单|畅销榜/i;
             const searchRe = /搜索|搜一下|搜榜|找资料|查资料|联网搜|资料员/i;
             if (scanRe.test(userInput) && !isFullPipelineRequest) {
-              // B-1 总编判断派给谁 (模型决策, 失败回退确定性 story-architect)
-              logInfo("[意图前置] 检测到扫榜, 快路径: 总编模型决策委派");
+              // B-1 委派决策: 扫榜靠 scan_bestseller (写入工具), story-explorer 是只读 agent
+              // (permissions.ts 硬拒), 派给它必然报"只读不能调用写入工具"→ 空交付 → 终审打回
+              // → 白白多跑一轮 25s。这是权限约束不是风格偏好, 候选清单里不再提供资料员。
+              logInfo("[意图前置] 检测到扫榜, 快路径: 委派 (候选限有 scan_bestseller 权限的 agent)");
               const scanDec = await fastPathDelegationDecision(userInput, [
-                { agent: "story-architect", label: "架构师", duty: "扫榜调研/拆书解构/大纲" },
-                { agent: "story-explorer", label: "资料员", duty: "联网搜索/资料检索" },
+                { agent: "story-architect", label: "架构师", duty: "扫榜调研/拆书解构/大纲 (有 scan_bestseller 写入权限)" },
               ], "story-architect");
               send({ type: "planner_decision", agent: "orchestrator", intent: "scan_bestseller_fast", route: `扫榜 → ${scanDec.agent}`, reason: scanDec.reason, steps: ["scan_detect", "orchestrator_picks_expert", "expert_own_loop", "orchestrator_final_review"] });
               // 总编的委派决策思考 (折叠显示)
@@ -676,17 +740,35 @@ function buildSseStream(pid: string, userInput: string, agentName: AgentName, se
               send({ type: "sub_agent_start", agent: scanDec.agent as AgentName, task: scanTask, depth: 1 });
               store.addMessage(pid, "assistant", JSON.stringify({ agent: scanDec.agent, task: scanTask }), { toolName: "sub_agent_start", toolCallId: scanDec.agent });
               // B-2 专家自跑 loop (思考/工具/正文都出自专家自己) + B-3 总编终审, 产出终审背书版
-              const scanCoreTool = scanDec.agent === "story-explorer" ? "web_search" : "scan_bestseller";
-              const scanCoreArgs = scanDec.agent === "story-explorer"
-                ? { query: userInput.slice(0, 200), max_results: 10 }
-                : { genre: (store.getProject(pid)?.genre as string) || "仙侠", platform: "番茄小说" };
-              const scanDeliverable = await runFastPathExpert(pid, runId, scanDec.agent, scanTask, userInput, scanCoreTool, scanCoreArgs, "扫榜", send);
+              // 核心工具恒定 = scan_bestseller: "扫榜"的语义就是抓榜单, 派给谁只影响"报告怎么写"。
+              // 旧逻辑跟专家走 (资料员 → web_search), 于是把整句"扫榜：抓取番茄小说…"拿去当搜索词,
+              // Bing 搜出"扫雷游戏/扫帚"这种垃圾, 还被当成成果交付 → 用户眼里就是"长任务跑了等于没跑"。
+              // 题材清洗: 项目 genre 形如 "东方仙侠 / 第一人称", 整串塞给榜单接口会被当成奇怪的
+              // 题材词导致召回跑偏 (实测抓回来一堆都市赘婿)。只取斜杠前的主题材。
+              const scanGenre = ((store.getProject(pid)?.genre as string) || "仙侠").split(/[\/、,，]/)[0].trim() || "仙侠";
+              const scanCoreTool = "scan_bestseller";
+              const scanCoreArgs = { genre: scanGenre, platform: "番茄小说" };
+              const r1 = await runFastPathExpert(pid, runId, scanDec.agent, scanTask, userInput, scanCoreTool, scanCoreArgs, "扫榜", send);
+              let expertUsed = scanDec.agent as AgentName;
+              let scanDeliverable = r1.content;
+              // 终审打回 → 再补救一次 (旧逻辑直接把被打回的内容当成果发 done, 长任务停在第 1 步)。
+              // 备选走 story-explorer + web_search: 它是只读 agent 拿不到 scan_bestseller,
+              // 但联网检索能补出行业报告/榜单文章, 总比交不出东西强。
+              if (!r1.approved) {
+                const alt = "story-explorer" as AgentName;
+                const scanFallbackQuery = `${scanGenre}小说排行榜 热门 题材 趋势`;
+                logInfo(`[意图前置] 扫榜交付被终审打回, 换 ${alt} (web_search 降级) 再跑一次`);
+                send({ type: "delegate", from: "orchestrator", to: alt, task: scanTask, depth: 1 });
+                send({ type: "sub_agent_start", agent: alt, task: scanTask, depth: 1 });
+                const r2 = await runFastPathExpert(pid, runId, alt, scanTask, userInput, "web_search", { query: scanFallbackQuery, max_results: 10 }, "扫榜(降级检索)", send);
+                if (r2.approved || r2.content.length > scanDeliverable.length) { scanDeliverable = r2.content; expertUsed = alt; }
+              }
               const subDur = Date.now() - t0p;
-              send({ type: "sub_answer", agent: scanDec.agent as AgentName, text: scanDeliverable });
-              send({ type: "sub_agent_done", agent: scanDec.agent as AgentName, result: scanDeliverable, durationMs: subDur });
-              store.addMessage(pid, "assistant", scanDeliverable, { toolName: "sub_answer", toolCallId: scanDec.agent });
-              store.addMessage(pid, "assistant", JSON.stringify({ agent: scanDec.agent, result: scanDeliverable.slice(0, 800), durationMs: subDur, early: true }), { toolName: "sub_agent_done", toolCallId: scanDec.agent });
-              send({ type: "done", agent: "orchestrator", steps: 1, stats: {}, runId });
+              finalSend({ type: "sub_answer", agent: expertUsed, text: scanDeliverable });
+              finalSend({ type: "sub_agent_done", agent: expertUsed, result: scanDeliverable, durationMs: subDur });
+              store.addMessage(pid, "assistant", scanDeliverable, { toolName: "sub_answer", toolCallId: expertUsed });
+              store.addMessage(pid, "assistant", JSON.stringify({ agent: expertUsed, result: scanDeliverable.slice(0, 800), durationMs: subDur, early: true }), { toolName: "sub_agent_done", toolCallId: expertUsed });
+              pendingDone = { agent: "orchestrator", steps: 1, stats: {} };
               return;
             }
             if (searchRe.test(userInput) && !isFullPipelineRequest) {
@@ -703,17 +785,25 @@ function buildSseStream(pid: string, userInput: string, agentName: AgentName, se
               send({ type: "sub_agent_start", agent: searchDec.agent as AgentName, task: searchTask, depth: 1 });
               store.addMessage(pid, "assistant", JSON.stringify({ agent: searchDec.agent, task: searchTask }), { toolName: "sub_agent_start", toolCallId: searchDec.agent });
               // B-2 专家自跑 loop + B-3 总编终审
+              // 同理: 搜索意图用干净关键词, 不要把"搜索：后面的整句"原样丢给搜索引擎
+              const cleanSearchQuery = (
+                userInput
+                  .replace(/^(搜索|搜一下|搜搜|搜榜|查资料|找资料|联网搜|资料员)\s*[：:，,]?\s*/i, "")
+                  .slice(0, 120) || userInput.slice(0, 60)
+              ).trim();
               const searchCoreTool = searchDec.agent === "story-architect" ? "scan_bestseller" : "web_search";
               const searchCoreArgs = searchDec.agent === "story-architect"
                 ? { genre: (store.getProject(pid)?.genre as string) || "仙侠", platform: "番茄小说" }
-                : { query: userInput.slice(0, 200), max_results: 10 };
-              const searchDeliverable = await runFastPathExpert(pid, runId, searchDec.agent, searchTask, userInput, searchCoreTool, searchCoreArgs, "搜索/资料", send);
+                : { query: cleanSearchQuery, max_results: 10 };
+              const sr = await runFastPathExpert(pid, runId, searchDec.agent, searchTask, userInput, searchCoreTool, searchCoreArgs, "搜索/资料", send);
+              const searchDeliverable = sr.content;
+              const searchExpert = searchDec.agent as AgentName;
               const subDur = Date.now() - t0s;
-              send({ type: "sub_answer", agent: searchDec.agent as AgentName, text: searchDeliverable });
-              send({ type: "sub_agent_done", agent: searchDec.agent as AgentName, result: searchDeliverable, durationMs: subDur });
-              store.addMessage(pid, "assistant", searchDeliverable, { toolName: "sub_answer", toolCallId: searchDec.agent });
-              store.addMessage(pid, "assistant", JSON.stringify({ agent: searchDec.agent, result: searchDeliverable.slice(0, 800), durationMs: subDur, early: true }), { toolName: "sub_agent_done", toolCallId: searchDec.agent });
-              send({ type: "done", agent: "orchestrator", steps: 1, stats: {}, runId });
+              send({ type: "sub_answer", agent: searchExpert, text: searchDeliverable });
+              send({ type: "sub_agent_done", agent: searchExpert, result: searchDeliverable, durationMs: subDur });
+              store.addMessage(pid, "assistant", searchDeliverable, { toolName: "sub_answer", toolCallId: searchExpert });
+              store.addMessage(pid, "assistant", JSON.stringify({ agent: searchExpert, result: searchDeliverable.slice(0, 800), durationMs: subDur, early: true, approved: sr.approved }), { toolName: "sub_agent_done", toolCallId: searchExpert });
+              pendingDone = { agent: "orchestrator", steps: 1, stats: {} };
               return;
             }
 
@@ -841,13 +931,24 @@ function buildSseStream(pid: string, userInput: string, agentName: AgentName, se
           }
         }
       } catch (e) {
-        send({ type: "error", message: friendlyError(e as Error, s.defaultModel) });
+        finalSend({ type: "error", message: friendlyError(e as Error, s.defaultModel) });
       } finally {
+        // 【关键】SSE 收尾必须在 finally 里, 不能只写在函数末尾:
+        // 扫榜/搜索/创建项目等快路径分支都是 early return, 原先绕过末尾的 close,
+        // 结果 controller 永不关闭 → HTTP 响应体不结束 → 前端一直转圈/像"连不上",
+        // 而且 8s 心跳定时器泄漏。finally 对所有 return 路径一视同仁地兜住,
+        // 并保证每条路径恰好收到一个 done。
         clearInterval(sseKeepalive);
+        if (!doneSent) {
+          const payload = pendingDone || { agent: agentName, steps: 0, stats: stats(pid) };
+          try { send({ type: "done", ...payload, runId } as SSEEvent); } catch { /* 流异常已关 */ }
+        }
+        // run 走完了就清掉取消标记 —— 用户可能点过停止后 run 才收尾,
+        // 不清理的话这个 runId 会在内存里白占 6 小时
+        clearRunCancel(runId);
+        closed = true;
+        try { controller.close(); } catch { /* already closed */ }
       }
-      send({ type: "done", agent: agentName, steps: 0, stats: stats(pid), runId });
-      closed = true;
-      try { controller.close(); } catch { /* already closed */ }
     },
   });
   return stream;

@@ -282,6 +282,15 @@ body{font-family:var(--sans);background:var(--paper);color:var(--ink);font-size:
   cursor:pointer;transition:.15s}
 .composer-send:hover{transform:scale(1.06);box-shadow:0 4px 12px rgba(161,61,61,.25)}
 
+/* 发送/停止二合一: 任务执行中变成方形(停止态), 悬停变红提示"点了会停" */
+.composer-send.stopping{border-radius:9px;background:var(--ink2)}
+.composer-send.stopping:hover{background:var(--red);box-shadow:none}
+
+/* 语音输入按钮: 录音中变红 + 呼吸脉冲 */
+.composer-icon-btn.recording{color:#fff;background:var(--red);border-color:var(--red);
+  animation:voice-pulse 1.2s ease-in-out infinite}
+@keyframes voice-pulse{0%,100%{box-shadow:0 0 0 0 rgba(196,61,61,.35)}50%{box-shadow:0 0 0 6px rgba(196,61,61,0)}}
+
 /* 模型 chip (在输入框上方或底部) */
 .composer-bottom-row{display:flex;align-items:center;gap:6px;padding:0 0 0 4px}
 .composer-icon-btn{flex-shrink:0;width:30px;height:30px;border-radius:var(--radius);

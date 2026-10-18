@@ -186,11 +186,11 @@ for %%P in (python3 python) do (
     )
 )
 if defined pycmd (
-    echo   + Python !pv!，Scrapling 侧车可用
-    if not exist ".venv-scrapling\.scrapling-installed" (
-        echo   [init] Scrapling 侧车初始化中，可能需要 1~2 分钟...
-        "%NODE_EXE%" scripts/install-scrapling.js >nul 2>&1
-    )
+    echo   + Python !pv!，检查 Scrapling 抓取侧车...
+    rem 每次都跑 installer: 它内部用 import scrapling 做真实校验 (marker 只做加速),
+    rem 已装好时秒退; 包丢了会自动重装。旧逻辑只看 marker 是否存在,
+    rem 一旦 marker 在、包不在, 就静默跳过 → 用户看到的就是"抓取压根没启用"。
+    "%NODE_EXE%" scripts/install-scrapling.js
 ) else (
     echo   [i] 未检测到 Python 3.10+，Scrapling 侧车不可用，抓取自动降级
     echo   需要时安装: python.org 下载 3.10~3.13，安装时勾选 Add to PATH

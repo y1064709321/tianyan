@@ -52,7 +52,7 @@ if exist "%PID_FILE%" (
     set /p PID=<"%PID_FILE%"
     tasklist /fi "PID eq !PID!" 2>nul | find /i "node" >nul 2>&1
     if !errorlevel! equ 0 (
-        echo  + 服务已在运行 (PID !PID!) → http://localhost:%PORT%/
+        echo  + 服务已在运行 [PID !PID!] → http://localhost:%PORT%/
         goto :eof
     )
 )
@@ -171,7 +171,7 @@ set /p PID=<"%PID_FILE%"
 tasklist /fi "PID eq %PID%" 2>nul | find /i "node" >nul 2>&1
 if !errorlevel! equ 0 (
     taskkill /PID %PID% /F >nul 2>&1
-    echo  + 已停止 (PID %PID%)
+    echo  + 已停止 [PID %PID%]
 )
 del "%PID_FILE%" >nul 2>&1
 exit /b 0
@@ -189,7 +189,7 @@ if !errorlevel! equ 0 (
     echo  ● 运行中  PID %PID%
     echo  访问: http://localhost:%PORT%/
 ) else (
-    echo  ○ 未运行 (PID 文件过期)
+    echo  ○ 未运行 [PID 文件过期]
     del "%PID_FILE%" >nul 2>&1
 )
 exit /b 0

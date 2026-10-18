@@ -19,6 +19,9 @@ import { buildWritingContext, summarizeChapter, updateCharacterStatesAfterChapte
 import { callScrapling } from "../scraplingClient.js";
 import { skeletonWriting, ruleQualityCheck, assessChapterRules, parseRankingItems, extractGenreDistribution, outlineSkeleton, weightedReviewScore, similarityCheck, detectAIHeuristic } from "../deterministic.js";
 import { buildAuditContext, auditDimensions, AUDIT_DIMENSIONS_TEXT, TOTAL_DIMENSIONS } from "./audit-dimensions.js";
+import { matchGenre, normGenre, genreKwsOf } from "./genreFilter.js";
+import * as fanqie from "./fanqie.js";
+import { isRunCancelled } from "../runCancel.js";
 import { getArcTarget } from "../store.js";
 
 // ===== Python 技能引擎桥接 =====
@@ -165,11 +168,14 @@ export async function dispatchTool(
         const requestedPlatform = String(args.platform || "起点中文网");
         // 抓取时刻 (UTC 本地时间, 前端/报告里标注, 让用户知道"这是哪天的榜")
         const fetchedAt = new Date().toLocaleString("zh-CN", { hour12: false });
-        // === 多平台: 并行抓全部 (起点/女频/番茄/晋江/飞卢/书旗/豆瓣/QQ阅读) ===
+        // === 多平台: 并行抓全部 (起点/女频/番茄/晋江/飞卢/书旗/QQ阅读) ===
+        // 【豆瓣已于 2026-10 移除】它不是网文平台 (出版书/电子书为主), 榜单对网文创作没有参考价值,
+        // 而且 read.douban.com 反爬最严, 每次都失败还占一个名额、拉低成功率分母。
+        // 用户若还传 platform="豆瓣", 会被当成未知平台加在首位尝试并失败, 不会再有兜底数据。
         // 用户指定了某平台 → 优先它 + 仍抓其余作参照; 没指定 → 全抓 (用户要"多网站")
-        // 实测可达性 (2026-09): 番茄 JSON API ✅ / 晋江 topten.php(GBK) ✅ / 起点反爬202壳页 ❌ (HTML fallback 出 0 条) /
-        // 飞卢/书旗/QQ阅读 HTML 解析命中率不稳; 都并行试, 抓到的进报告, 失败的诚实标注, 不静默丢
-        const SCAN_ALL_PLATFORMS = ["起点中文网", "起点女生网", "番茄小说", "晋江文学城", "飞卢", "书旗", "豆瓣", "QQ阅读"];
+        // 实测可达性: 番茄 JSON API ✅ / 起点·起点女生·晋江·书旗 ✅ (真实浏览器层) /
+        // 飞卢·QQ阅读 ❌ (风控打不过); 都并行试, 抓到的进报告, 失败的诚实标注, 不静默丢
+        const SCAN_ALL_PLATFORMS = ["起点中文网", "起点女生网", "番茄小说", "晋江文学城", "飞卢", "书旗", "QQ阅读"];
         const platformOrder = (() => {
           if (requestedPlatform && requestedPlatform !== "起点中文网" && !SCAN_ALL_PLATFORMS.includes(requestedPlatform)) {
             return [requestedPlatform, ...SCAN_ALL_PLATFORMS];
@@ -198,10 +204,18 @@ export async function dispatchTool(
         const rawCrawl = fallback.raw;
         // LLM 趋势归纳 (结构化输入, 全部平台命中条目, 降低弱模型解析负担)
         const allParsed = allResults.filter((r) => r.ok).flatMap((r) => r.items);
+        // 【防编造闸门】上面列出的条目就是工具真实抓到的**全部**来源。
+        // 2026-10-17 事故: 主笔被误派去扫榜时, 我们只给了 2 条真·仙侠, 它交回一张 12 行表格,
+        // 前两名是《最强龙婿》《极品全才神婿》—— 这两本存在于番茄综合榜, 但全是都市赘婿文,
+        // 且当时压根没喂给它。LLM 的动机就是"表格太空不好看", 所以这里把话说到死。
+        const ANTI_FABRICATION = "\n【严禁编造 — 硬约束】上表 + 下方原始数据里的书名/作者/简介, 是本次工具**真实抓取到的全部来源**。\n" +
+          "你的报告只能使用这里面出现过的作品, 严禁凭记忆、印象或常识补充任何未列出的书名,\n" +
+          "也严禁为了把表格填满而补数据。抓到 2 部就写 2 部 —— 写得少不是缺陷, 编数据一律被终审打回。\n\n";
         const structuredInput = allParsed.length
           ? "【已结构化解析】\n" + allResults.map((r) => (r.ok ? `【${r.platform}】` : `【${r.platform}】(抓取失败)`)).join("\n") + "\n" +
             allParsed.slice(0, 40).map((i) => `  ${i.rank}. ${i.title} | ${i.author} | ${i.blurb.slice(0, 50)}`).join("\n") +
             "\n【题材分布】" + Object.entries(allResults.reduce((acc, r) => { Object.entries(r.genreDist).forEach(([k, v]) => acc[k] = (acc[k] || 0) + v); return acc; }, {} as Record<string, number>)).filter(([, v]) => v > 0).slice(0, 8).map(([k, v]) => `${k}×${v}`).join(" ") +
+            ANTI_FABRICATION +
             "\n\n【原始数据】\n"
           : "【警告】所有平台榜单抓取均失败 (反爬/网络限制), 无真实榜单数据。\n";
         let resp: { content: string };
@@ -1208,6 +1222,23 @@ interface PlatformConfig {
   api?: Record<string, string>;
   /** 页面编码: GBK 平台 (晋江) 需手动解码, 否则中文乱码 */
   charset?: string;
+  /**
+   * 强制先走真实浏览器层 (Playwright + DOM 选择器), 不先看 HTML 层。
+   * 用于"HTML 层能抓到但抽出的是脏数据、且脏数据过得了 looksLikeGarbage 校验"的平台 ——
+   * 书旗书名和作者是相邻无分隔的两个 span, 去标签后粘成一团, 看起来仍像书名。
+   */
+  rbFirst?: boolean;
+  /**
+   * 平台专属抓取 (优先于 api/HTML 通用流程)。
+   * 用于"通用流程表达不了"的平台: 番茄有三套互不相关的榜 (作家榜/巅峰榜/分类榜),
+   * 分类榜还是 PUA 字体混淆, 需要拿 bookId 二次抓详情页还原 —— 塞不进 url→JSON→list 这套通用流程。
+   * 返回 null 表示"这个榜我不处理", 调用方会继续走通用流程。
+   */
+  customFetch?: (board: string, genre: string) => Promise<{
+    items: string[];
+    rawText: string;
+    url: string;
+  } | null>;
 }
 
 const PLATFORMS: PlatformConfig[] = [
@@ -1273,12 +1304,17 @@ const PLATFORMS: PlatformConfig[] = [
   {
     match: ["起点女生", "qdmm", "女频"],
     defaultBoard: "畅销榜",
+    // 【必须用 qdmm.com 而不是 qidian.com/rank/*/fin/】
+    // 起点女生网是独立域名 www.qdmm.com。早前配成 `qidian.com/rank/hotsales/fin/`,
+    // 那个 "fin" 段实测会被起点忽略并回落到男生站内容 —— 于是「起点女生网」和
+    // 「起点中文网」抓回同一份榜单, 8 个名额白占一个, 女频趋势永久缺失。
+    // 2026-10 实测 qdmm.com 四个榜单 each ~5s / 20 条, 均正常。
     boards: {
-      "畅销榜": "https://www.qidian.com/rank/hotsales/fin/",
-      "月票榜": "https://www.qidian.com/rank/yuepiao/fin/",
-      "人气榜": "https://www.qidian.com/rank/readIndex/fin/",
-      "收藏榜": "https://www.qidian.com/rank/collect/fin/",
-      "新书榜": "https://www.qidian.com/rank/newBook/fin/",
+      "畅销榜": "https://www.qdmm.com/rank/hotsales/",
+      "月票榜": "https://www.qdmm.com/rank/yuepiao/",
+      "人气榜": "https://www.qdmm.com/rank/readIndex/",
+      "收藏榜": "https://www.qdmm.com/rank/collect/",
+      "新书榜": "https://www.qdmm.com/rank/newBook/",
     },
     extract: (text, board) => {
       const out: string[] = [];
@@ -1303,18 +1339,67 @@ const PLATFORMS: PlatformConfig[] = [
   // ---- 番茄小说 ----
   {
     match: ["番茄", "fanqie"],
-    defaultBoard: "阅读榜",
+    // 【默认不再是"阅读榜"】/api/rank/list?way=N 是**假榜**: way=1..8 全部返回同一份都市赘婿综合榜,
+    // 没有任何题材区分度, 用户当场指出"这种的榜没啥作用"。默认改抓按题材分类的**分类榜**。
+    // 老的阅读榜/热度榜/新书榜保留在下面, 手动指定 board 仍能抓 (用户要求降级但不删除)。
+    defaultBoard: "分类榜",
     boards: {
+      "分类榜": "https://fanqienovel.com/rank",
+      "分类新书榜": "https://fanqienovel.com/rank",
+      "金番作家榜": "https://fanqienovel.com/",
+      "巅峰榜": "https://fanqienovel.com/",
       "阅读榜": "https://fanqienovel.com/rank",
-      "新书榜": "https://fanqienovel.com/rank",
       "热度榜": "https://fanqienovel.com/rank",
-      // 番茄有男频/女频 + 多题材子榜, URL共用 /rank
+      "新书榜": "https://fanqienovel.com/rank",
     },
     // 番茄 /rank 页是 JS 渲染壳页, 真实数据走 JSON API (已实测: /api/rank/list?way=1 返回 data.list[].bookName/author/abstract)
     api: {
       "阅读榜": "https://fanqienovel.com/api/rank/list?way=1",
       "热度榜": "https://fanqienovel.com/api/rank/list?way=2",
       "新书榜": "https://fanqienovel.com/api/rank/list?way=3",
+    },
+    // 三套榜 + 字体混淆还原, 全部在 src/agents/fanqie.ts
+    customFetch: async (board: string, genre: string) => {
+      const FQ_URL = "https://fanqienovel.com/";
+      if (board === "金番作家榜") {
+        const authors = await fanqie.fetchFanqieAuthorBoard();
+        if (authors.length === 0) return null;
+        const items = fanqie.formatFanqieBooks(authors, "番茄金番作家榜（殿堂作家 / 金番作家，按平台作家等级排序）");
+        return { items, rawText: items.join("\n"), url: FQ_URL + "api/author/misc/top_author_list/v1/" };
+      }
+      if (board === "巅峰榜") {
+        const tops = await fanqie.fetchFanqieTopBooks(30);
+        if (tops.length === 0) return null;
+        const items = fanqie.formatFanqieBooks(tops, "番茄巅峰榜（按好评、人气、互动综合得分）");
+        return { items, rawText: items.join("\n"), url: FQ_URL + "api/author/misc/top_book_list/v1/" };
+      }
+      if (board === "分类榜" || board === "分类新书榜") {
+        const isNew = board === "分类新书榜";
+        const cat = fanqie.pickFanqieCategory(genre);
+        // 番茄没有"武侠"大类, 也没有泛"言情" —— 映射不到就如实回退巅峰榜,
+        // 绝不拿个不沾边的分类冒充 (历史上拿都市赘婿榜冒充仙侠榜被用户当场抓包)
+        if (!cat) {
+          const tops = await fanqie.fetchFanqieTopBooks(20);
+          if (tops.length === 0) return null;
+          const items = fanqie.formatFanqieBooks(
+            tops,
+            `番茄巅峰榜（⚠️ 番茄无「${genre}」对应分类，改抓全站头部精品，仅供参考）`,
+          );
+          return { items, rawText: items.join("\n"), url: FQ_URL + "api/author/misc/top_book_list/v1/" };
+        }
+        const books = await fanqie.fetchFanqieCategoryBoard(cat, isNew ? 2 : 1);
+        if (books.length === 0) return null;
+        const items = fanqie.formatFanqieBooks(
+          books,
+          `番茄${cat.name}·${isNew ? "新书" : "阅读"}榜（按在读数据排序，${isNew ? "30万字以下" : "30万字以上"}）`,
+        );
+        return {
+          items,
+          rawText: items.join("\n"),
+          url: `https://fanqienovel.com/api/rank/category/list?category_id=${cat.id}&gender=${cat.gender}&rankMold=${isNew ? 2 : 1}`,
+        };
+      }
+      return null; // 阅读榜/热度榜/新书榜走下方通用 api 流程
     },
     extract: (text, board) => {
       const clean = text.replace(/\s+/g, " ");
@@ -1393,6 +1478,10 @@ const PLATFORMS: PlatformConfig[] = [
   {
     match: ["书旗", "shuqi"],
     defaultBoard: "点击榜",
+    // 【强制走真实浏览器层】去标签后的纯文本把"序号+书名+作者"粘成一串 ("2 村野乱事黄金水饺"),
+    // 旧正则抽出的书名全都带着序号、尾部还挂着作者名, 且长得像书名 → 混进趋势归纳。
+    // 浏览器层按 <span class="bn">/<span class="au"> 精确拆开。
+    rbFirst: true,
     boards: {
       "点击榜": "https://www.shuqi.com/rank",
     },
@@ -1411,19 +1500,6 @@ const PLATFORMS: PlatformConfig[] = [
     },
   },
 
-  // ---- 豆瓣阅读 ----
-  {
-    match: ["豆瓣", "douban", "豆瓣阅读"],
-    defaultBoard: "畅销榜",
-    boards: {
-      "畅销榜": "https://read.douban.com/charts/bestseller/novel",
-      "新书榜": "https://read.douban.com/charts/bestseller/novel",
-    },
-    extract: (text, _board) => {
-      return text.replace(/\s+/g, " ").slice(0, 2000);
-    },
-  },
-
   // ---- QQ阅读 ----
   {
     match: ["QQ阅读", "qq阅读", "qq阅读", "book.qq"],
@@ -1439,7 +1515,34 @@ const PLATFORMS: PlatformConfig[] = [
 
 /** 根据平台名和board名匹配平台配置 */
 function findPlatform(platform: string): PlatformConfig | undefined {
-  return PLATFORMS.find(p => p.match.some(m => platform.includes(m)));
+  // 【最长匹配优先】"起点女生网" 同时能被 "起点" 和 "起点女生网" 命中,
+  // 按 PLATFORMS 数组顺序取第一个会落到起点配置 → 两个平台抓同一份榜单, 白占一个名额。
+  // 按命中的 match 关键字长度降序排, 更具体的那个赢。
+  const hits = PLATFORMS
+    .map((p) => ({ p, len: Math.max(...p.match.filter((m) => platform.includes(m)).map((m) => m.length), 0) }))
+    .filter((x) => x.len > 0)
+    .sort((a, b) => b.len - a.len);
+  return hits[0]?.p;
+}
+
+/**
+ * extract 正则抽出来的东西到底能不能用。
+ * 实测书旗会抽出 "**《**《2》**" —— 把排名序号当成书名, 旧逻辑照样当成功交给 LLM 归纳,
+ * 脏数据混进趋势分析。这里统一按"书名是否像书名"判定。
+ */
+function looksLikeGarbage(items: string[]): boolean {
+  if (items.length === 0) return true;
+  const titles = items
+    .map((l) => (l.match(/《([^》]*?)》/) || [])[1] || "")
+    .map((t) => t.trim())
+    .filter((t) => t.length > 0);
+  // 书名缺失 / 过短 / 纯符号纯数字 → 判垃圾
+  if (titles.length === 0) return true;
+  // 【陷阱】别用 /^[\d\s\W_]+$/ : \w 只含 [A-Za-z0-9_], 而汉字属于 \W → 所有中文书名都被误判为
+  // 垃圾, 结果就是每次都触发"真实浏览器层重抽"。这里要用 Unicode 属性转义判纯符号串。
+  const isJunk = (t: string) => /^[^\p{L}\p{N}]+$/u.test(t) || /^\d+$/u.test(t);
+  const bad = titles.filter((t) => t.length < 2 || isJunk(t)).length;
+  return bad / titles.length > 0.4;
 }
 
 /** 根据board名模糊匹配到具体URL */
@@ -1455,6 +1558,29 @@ function resolveBoardUrl(conf: PlatformConfig, board: string): { url: string; bo
   return { url: conf.boards[conf.defaultBoard]!, boardName: conf.defaultBoard };
 }
 
+/**
+ * 【承诺型委派】从总编正文里认出它点名的专家。
+ * 总编写了 "我将委派主笔 agent 撰写第一章正文" 却没发 tool_call 时, 代码层要补发这次委派,
+ * 目标必须以**它点名的那个**为准 —— 否则按 PHASES[currentPhase] 硬路由会派错人
+ * (项目 phase 常停在 1=扫榜, 用户要写正文时被派回架构师再扫一次榜)。
+ * 认不出来返回 undefined, 由调用方回退到阶段表。
+ */
+const PLEDGE_AGENT_ALIASES: Array<[RegExp, string]> = [
+  [/主笔|写手|撰稿|写正文|narrative[-_]?writer|\bwriter\b/i, "narrative-writer"],
+  [/架构师|拆书|大纲|architect/i, "story-architect"],
+  [/角色|人设|人物|character[-_]?designer/i, "character-designer"],
+  [/审校|质检|审核|一致性|checker|consistency/i, "consistency-checker"],
+  [/资料员|检索|搜资料|explorer/i, "story-explorer"],
+  [/交付|汇报|presenter/i, "presenter"],
+];
+function pledgeTarget(body: string): string | undefined {
+  if (!body) return undefined;
+  for (const [re, name] of PLEDGE_AGENT_ALIASES) {
+    if (re.test(body)) return name;
+  }
+  return undefined;
+}
+
 async function crawlRanking(
   platform: string,
   genre: string,
@@ -1465,19 +1591,24 @@ async function crawlRanking(
   const apiConf = conf as PlatformConfig & { api?: Record<string, string> };
   // === 优先走 JSON API (真实结构化数据, 绕开 JS 渲染壳页) ===
   const apiPath = apiConf.api?.[boardName];
-  // 题材过滤: 榜单抓回后按 title+abstract 关键词打分, 命中 0 条才用全量 (并标注偏离)
-  const GENRE_KEYWORDS: Record<string, string[]> = {
-    "仙侠": ["仙", "剑", "道", "修仙", "飞升", "元婴", "渡劫", "金丹", "灵气", "宗门", "修仙", "天劫"],
-    "玄幻": ["魔法", "异世", "武魂", "血脉", "斗气", "圣", "神域"],
-    "都市": ["总裁", "都市", "兵王", "豪门", "赘婿", "战神", "神医", "医"],
-    "科幻": ["星", "机甲", "未来", "科技", "宇宙", "赛博"],
-    "悬疑": ["谜", "案", "查", "恐怖", "灵异", "推理"],
-    "武侠": ["江湖", "侠", "镖", "武功", "门派"],
-    "言情": ["婚", "爱", "甜", "虐", "恋爱", "婚约"],
-  };
-  const genreKws = genre ? (GENRE_KEYWORDS[genre] || []) : [];
-  const matchGenre = (title: string, blurb: string) =>
-    genreKws.length === 0 ? true : genreKws.some((k) => title.includes(k) || blurb.includes(k));
+  // 题材过滤: 榜单抓回后按 title+abstract 关键词打分, 命中 0 条才用全量 (并标注偏离)。
+  // 词表与判定逻辑全部在 src/agents/genreFilter.ts (纯函数 + 有回归用例), 不要在这里再抄一份 ——
+  // 抄一份就等于改词表时改了这边忘了那边, 历史上因此反复出现"赘婿文被判成仙侠"。
+  const genreCanon = normGenre(genre);
+  const genreKws = genreKwsOf(genre);
+  // === 平台专属抓取 (番茄: 作家榜/巅峰榜/分类榜三套体系 + PUA 字体混淆二次还原) ===
+  // 返回 null 表示该榜不由专属逻辑处理, 继续往下走通用 api / HTML 流程。
+  if (conf.customFetch) {
+    try {
+      const cr = await conf.customFetch(boardName, genre);
+      if (cr && cr.items.length > 0) {
+        logInfo(`[扫榜] ${platform} 平台专属抓取成功 (${cr.items.length} 条) 榜=${boardName} 题材=${genre} ${cr.url}`);
+        return { source: "platform-custom", board: boardName, url: cr.url, items: cr.items, rawText: cr.rawText };
+      }
+    } catch (e) {
+      logInfo(`[扫榜] ${platform} 平台专属抓取失败 (${(e as Error).message?.slice(0, 60)}), 回退通用流程`);
+    }
+  }
   if (apiPath) {
     try {
       const resp = await fetch(apiPath, {
@@ -1488,9 +1619,9 @@ async function crawlRanking(
       let list: any[] = j?.data?.list || j?.list || [];
       let apiPathForLog = apiPath;
       // 番茄 API way=1 返回综合榜, 不带分类过滤; 拼接题材词到查询让 API 尽量命中对应分类
-      if (apiPath.includes("fanqienovel.com") && genre) {
+      if (apiPath.includes("fanqienovel.com") && genreCanon) {
         const sep = apiPath.includes("?") ? "&" : "?";
-        const filteredPath = apiPath + sep + "keyword=" + encodeURIComponent(genre);
+        const filteredPath = apiPath + sep + "keyword=" + encodeURIComponent(genreCanon);
         try {
           const resp2 = await fetch(filteredPath, {
             headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36" },
@@ -1498,7 +1629,16 @@ async function crawlRanking(
           });
           const j2: any = await resp2.json();
           const list2: any[] = j2?.data?.list || j2?.list || [];
-          if (list2.length > 0) {
+          // 【别自欺欺人】番茄 rank API 实测**根本不吃 keyword 参数**: 加与不加返回同一份综合榜
+          // (全是都市赘婿/总裁文)。旧代码只要 list2 非空就宣布"题材过滤查询命中 N 条",
+          // 于是同一份 unrelated 的综合榜被当成"仙侠榜"转手交给 LLM —— 用户当场发现数据不对。
+          // 书单完全相同就说明参数没生效: 不换榜, 如实记日志, 交给下方本地题材关键词兜底。
+          const key = (b: any) => String(b?.bookId || b?.book_id || b?.bookName || b?.book_name || b?.title || "");
+          const unchanged = list2.length > 0 && list2.length === list.length &&
+            list2.every((b, i) => key(b) === key(list[i]));
+          if (unchanged) {
+            logInfo(`[扫榜] ${platform} keyword 题材参数无效 (返回与不过滤完全相同, 仍是综合榜), 改由本地题材关键词过滤`);
+          } else if (list2.length > 0) {
             logInfo(`[扫榜] ${platform} 题材过滤查询命中 ${list2.length} 条 ${filteredPath}`);
             list = list2;
             apiPathForLog = filteredPath;
@@ -1508,7 +1648,7 @@ async function crawlRanking(
       // 不再拼 items[] (会被 parseRankingItems 二次解析错乱), 直接输出结构化文本行
       // 按题材过滤: 命中的排前面; 全部偏离时仍展示全量并标注
       const filtered = genreKws.length > 0
-        ? list.filter((b) => matchGenre(String(b.bookName || b.book_name || b.title || ""), String(b.abstract || b.summary || "")))
+        ? list.filter((b) => matchGenre(String(b.bookName || b.book_name || b.title || ""), String(b.abstract || b.summary || ""), genre))
         : list;
       const useList = filtered.length > 0 ? filtered : list;
       const out: string[] = [];
@@ -1566,6 +1706,31 @@ async function crawlRanking(
   if (!text && !err) return { source: "browser", board: bn, url, items: [], rawText: "" };
   const extracted = err ? "抓取失败: " + err : conf.extract(text, bn);
   const items = err ? [] : extracted.split("\n").filter(l => l.trim()).slice(0, 30);
+
+  // === 质量校验 + 真实浏览器层升级 ===
+  // 两层触发场景:
+  //  a) HTML 层压根没抓到 (起点等腾讯云 WAF 返回 202 + probe.js 探针, curl_cffi 打不过);
+  //  b) 抓到了但 extract 正则解析出的是垃圾 (书旗实测抽出 "**《**《2》**" 这种把排名序号
+  //     当成书名的条目) —— 这种情况以前也会被当成功, 把脏数据混进趋势归纳。
+  // 两种情况都交给 Playwright Chromium + stealth 补丁用 DOM 选择器重抽。
+  //  c) 平台标了 rbFirst (书旗): HTML 层自身抽出的就是脏数据且过得了上述校验, 直接走浏览器层。
+  if (!err && (looksLikeGarbage(items) || conf.rbFirst)) {
+    const { realBrowserFetch, formatRankItems } = await import("../realBrowser.js");
+    const rb = await realBrowserFetch(url, { waitMs: 3500 }).catch(() => null);
+    const rbLines = rb?.ok && rb.items.length > 0 ? formatRankItems(rb.items) : [];
+    // 【必须二次校验】浏览器层的通用抽取器在有些站会把导航链接当成书名
+    // (晋江实测抽出《作品库》《VIP作品》)。它抽出来的如果还是垃圾, 就保留 HTML 层结果,
+    // 不能无条件覆盖 —— 那等于把本来还行的榜单换成更差的。
+    if (rbLines.length > 0 && !looksLikeGarbage(rbLines)) {
+      logInfo(`[扫榜] ${platform} 真实浏览器层${usedScrapling ? "重抽 (HTML 层解析为垃圾)" : "突破 WAF"} 成功 (${rbLines.length} 条)`);
+      return { source: "real-browser", board: bn, url, items: rbLines, rawText: `${rb?.title || ""}\n${rbLines.join("\n")}` };
+    }
+    logInfo(
+      `[扫榜] ${platform} 真实浏览器层未产出有效书名` +
+        (rbLines.length > 0 ? " (抽到的是导航/噪声)" : rb?.error ? ` (${rb.error.slice(0, 60)})` : "") +
+        ", 保留 HTML 层结果",
+    );
+  }
   return {
     // usedScrapling=true 时 source 标 "scrapling" (curl_cffi 指纹破反爬), 否则 "browser" (降级 fetch)
     source: err ? "error" : usedScrapling ? "scrapling" : "browser",
@@ -1963,6 +2128,45 @@ export async function finalReviewDeliverable(
   return { content, approved: false, score, verdict };
 }
 
+/**
+ * 终审 + 返修闭环 (2026-10-18 新增)。
+ *
+ * 以前的断链: finalReviewDeliverable 打回后, 调用方只是把裁决意见**附在文本末尾**就交付了 ——
+ * 终审写的"修改指令"从未送回专家手里, run 直接结束。用户看到的就是:
+ * 「拆书只回了句启动语 → 终审 0/10 → 然后没有下文, 没有任何返修任务和工具执行」。
+ *
+ * 这里把闭环补上: 打回 → 调 rework(feedback) 让**同一个专家**带着修改指令重跑 → 再终审,
+ * 最多 maxRounds 轮。专家还是交不出东西 → 交最后一次产出 + 裁决标注 (不无限循环)。
+ */
+export async function finalReviewWithRework(
+  pid: string, runId: string, expertAgent: AgentName, deliverableLabel: string,
+  initialContent: string,
+  emit: (evt: SSEEvent) => void,
+  rework: (feedback: string) => Promise<string>,
+  maxRounds = 1,
+): Promise<{ content: string; approved: boolean; score: number; verdict: string; reworked: number }> {
+  let content = initialContent;
+  let review = await finalReviewDeliverable(pid, runId, expertAgent, deliverableLabel, content, emit);
+  let rounds = 0;
+  while (!review.approved && rounds < maxRounds) {
+    rounds++;
+    emit({ type: "observation", agent: DEFAULT_AGENT, tool: "rework", result: `终审打回, 责令 ${expertAgent} 返修 (第 ${rounds}/${maxRounds} 轮): ${review.verdict.slice(0, 120)}` });
+    let revised = "";
+    try {
+      revised = (await rework(review.verdict)).trim();
+    } catch (e) {
+      logWarn(`[终审返修] ${expertAgent} 第 ${rounds} 轮返修执行异常: ${(e as Error).message?.slice(0, 100)}`);
+    }
+    if (!revised) {
+      logWarn(`[终审返修] ${expertAgent} 第 ${rounds} 轮仍无产出, 停止返修, 交原稿+裁决`);
+      break; // 返修也交不出东西 → 不死循环
+    }
+    content = revised;
+    review = await finalReviewDeliverable(pid, runId, expertAgent, `${deliverableLabel} (返修${rounds})`, content, emit);
+  }
+  return { content: review.approved ? review.content : content, approved: review.approved, score: review.score, verdict: review.verdict, reworked: rounds };
+}
+
 // ===== Agent 循环 =====
 
 interface RunState {
@@ -2117,13 +2321,13 @@ const TOOL_SCHEMAS: Record<string, ToolDefinition> = {
     type: "function",
     function: {
       name: "scan_bestseller",
-      description: "扫描小说平台榜单。支持: 起点/番茄/晋江/飞卢/书旗/豆瓣/QQ阅读。board可选: 畅销榜/月票榜/人气榜/追读榜/收藏榜/三江(当前)/往期三江/阅读榜/新书榜等。不指定board则默认抓畅销榜。用户要求三江就抓三江，要求往期就抓往期。",
+      description: "扫描小说平台榜单。支持: 起点/起点女生网/番茄/晋江/飞卢/书旗/QQ阅读。board可选: 畅销榜/月票榜/人气榜/追读榜/收藏榜/三江(当前)/往期三江/阅读榜/新书榜等；番茄另有 金番作家榜(殿堂作家+金番作家及代表作)/巅峰榜(头部精品)/分类榜(按项目题材自动选对应分类, 默认)/分类新书榜。不指定board则默认抓该平台默认榜(番茄=分类榜)。用户要求三江就抓三江，要求往期就抓往期。",
       parameters: {
         type: "object",
         properties: {
-          platform: { type: "string", description: "平台名称，如: 起点/番茄/晋江/飞卢/书旗/豆瓣/QQ阅读" },
+          platform: { type: "string", description: "平台名称，如: 起点/起点女生网/番茄/晋江/飞卢/书旗/QQ阅读" },
           genre: { type: "string", description: "题材/类型，如: 仙侠/都市/玄幻/言情，不指定则全品类" },
-          board: { type: "string", description: "榜单名称，如: 畅销榜/月票榜/人气榜/三江/往期三江/阅读榜/新书榜/追读榜/收藏榜。默认: 畅销榜" },
+          board: { type: "string", description: "榜单名称，如: 畅销榜/月票榜/人气榜/三江/往期三江/阅读榜/新书榜/追读榜/收藏榜；番茄还支持 金番作家榜/巅峰榜/分类榜/分类新书榜。不指定则用该平台默认榜(番茄=分类榜，按项目题材自动选分类)" },
         },
         required: ["platform"],
       },
@@ -2282,6 +2486,15 @@ export async function runAgentLoop(state: RunState): Promise<string> {
     step++;
     if (state.sharedSteps) state.sharedSteps.value = step;
     round++;
+    // 用户点了「停止」→ 收尾退出。协作式取消: 不硬杀正在进行的 LLM 请求
+    // (硬杀会让已经写了一半的章节留在库里, 状态更乱), 而是在轮与轮之间干净退出。
+    if (isRunCancelled(runId)) {
+      logInfo(`[停止] agent=${agentName} run=${runId} 用户取消, 主循环退出 (第${round}轮)`);
+      emit({ type: "observation", agent: agentName, tool: "user_cancelled", result: "已按用户要求停止。" });
+      clearInterval(heartbeatTimer);
+      store.finishRun(runId, "cancelled");
+      return bestContent || "（已按你的要求停止）";
+    }
     // 本轮是否为"委派收尾轮" (总编刚拿到子agent结果, 强制要真实汇报正文)
     const closingRound = agentName === "orchestrator" && !!state.pendingDelegationReport;
     // 超时检查
@@ -2353,6 +2566,15 @@ export async function runAgentLoop(state: RunState): Promise<string> {
       logInfo("[流式LLM调用] agent="+agentName+" round="+round+" model="+(agentModel?agentModel.model:"?")+" 消息数="+messages.length+" 工具数="+(agentTools?agentTools.length:0));
       const streamGen = llmStream(messages, agentModel, { tools: agentTools });
       for await (const chunk of streamGen) {
+        // 用户点了「停止」→ 立即中断本轮流式, 不再把 token 转成前端输出, 也不再执行后面的工具。
+        // 放在这里是**最即时的检查点**: LLM 是逐 chunk 返回的, 不用等整轮跑完才响应取消。
+        if (isRunCancelled(runId)) {
+          logInfo(`[停止] agent=${agentName} run=${runId} 用户取消, 中断流式输出`);
+          emit({ type: "observation", agent: agentName, tool: "user_cancelled", result: "已按用户要求停止, 本轮输出到此为止。" });
+          clearInterval(heartbeatTimer);
+          store.finishRun(runId, "cancelled");
+          return "（已按你的要求停止）";
+        }
         // USAGE_PREFIX: LLM 返回 usage 统计 (含 prefix cache 命中率)
         if (chunk.startsWith(USAGE_PREFIX)) {
           try {
@@ -2472,6 +2694,23 @@ export async function runAgentLoop(state: RunState): Promise<string> {
           fullContent += chunk;
           emit({ type: "token", agent: agentName, content: chunk });
         }
+      }
+
+      // === 【关键】本轮是否真的拿到了产出 ===
+      // 旧代码这里缺一个"成功即跳出": 流式正常返回内容后, 控制流仍走到下一次 streamAttempt,
+      // 在循环顶部被当成"连接失败重试"处理 —— 打 llm_reconnecting + sleep 18~300s,
+      // 并把本轮刚拿到的内容/工具调用清空重来。后果:
+      //   · 每个 LLM 回合固定烧 10 次调用 (MAX_STREAM_RETRIES), token ×10
+      //   · 每次之间 sleep 18s, 一个回合动辄 3 分钟
+      //   · 前端持续收到 llm_reconnecting, 用户看到的就是"长任务时模型连不上"
+      // 现在: 拿到东西立刻跳出; 只有全空 (0 chunk / 无 thinking / 无 tool_call) 才算失败继续重试,
+      // 连续 2 次空则直接跳出, 交给下方 consecutiveEmptyCount 分支走非流式回退。
+      const gotOutput = fullContent.trim().length > 0 || thinkingText.trim().length > 0 || nativeToolCalls.length > 0;
+      if (gotOutput) break;
+      consecutiveEmptyCount++;
+      if (consecutiveEmptyCount >= 2) {
+        logWarn("[流式重试] agent=" + agentName + " 连续" + consecutiveEmptyCount + "次空响应, 跳出重试循环, 走下方非流式兜底");
+        break;
       }
     } catch (e) {
       const errObj = e as Error;
@@ -2642,7 +2881,23 @@ export async function runAgentLoop(state: RunState): Promise<string> {
     // 【仅超时/降级才接管】正常轮一律让主 Agent 自己发 delegate_to_agent — 旁路抢着代跑会把
     // 主 Agent 的"拆任务权"架空 (它名义上是大脑, 实际只是转发工具结果的嘴)。
     // 只有本轮 LLM 确实降级 (429/配额耗尽/重试过/空响应) 才由代码层接管, 保证限流时仍能出结果。
-    const isDegradedRound = llmDegraded || rateLimitHit || !(content || "").trim();
+    //
+    // 【例外: "承诺型委派" 也算需要接管】(2026-10 修)
+    // 实测总编在正文里写 "我将委派主笔 agent 撰写第一章正文。" 然后一个 tool_call 都不发,
+    // 循环把它当最终答复 → done → 用户看到"总编说要委派, 然后任务就结束了", 正文一个字没写。
+    // 这种情况模型已经做完了决策 (派给谁、干什么都写清楚了), 只是**没落成 tool_call**,
+    // 代码层接管并不夺它的决策权 —— 夺的只是"说了不做"。
+    // 判据收紧三重, 避免误伤真实的汇报正文:
+    //   ① 本 run 还没委派过 (已委派过就是收尾汇报轮, 不该再动)
+    //   ② 正文很短 (<=300 字) —— 装得下"我要派人"但装不下任何交付物
+    //   ③ 含明确的执行意向句式 (意向副词 + 委派/执行/开始… + 角色名或成果名)
+    const bodyText0 = (content || "").trim();
+    const isDelegationPledge =
+      !state.orchestratorDelegated &&
+      bodyText0.length > 0 &&
+      bodyText0.length <= 300 &&
+      /(?:我将|我要|我马上|接下来|现在就|准备|打算|即将|稍后|随后|然后)?\s*(?:委派|交给|指派|安排|派给|让|执行|启动|调用|开展|开始|动笔)\s*[^。！？\n]{0,16}?(?:agent|专家|主笔|架构师|策划|资料员|审校|质检|角色|编剧|写作|撰文|正文|设定|Step|步骤|阶段|writer|architect|explorer|checker|designer|presenter)/i.test(bodyText0);
+    const isDegradedRound = llmDegraded || rateLimitHit || !bodyText0.trim() || isDelegationPledge;
     if (nativeToolCalls.length === 0 && agentName === "orchestrator" && depth === 0 && isDegradedRound) {
       const body = (content || "").trim();
       // 找 messages 里最后一条 user 消息作为用户原文
@@ -2653,14 +2908,43 @@ export async function runAgentLoop(state: RunState): Promise<string> {
       // 三类意图优先级: 扫榜(scan_bestseller) > 搜索(web_search) > 阶段兜底
       const isScanIntent = !state.orchestratorDelegated
         && /扫榜|扫.*榜|榜单|畅销榜|扫榜调研/i.test(body || userText);
-      const intentMatch = body.match(/委派|@|\barchitect\b|\bwriter\b|架构师|主笔|总编|拆书|正文|审稿|质检/i);
-      const isDelegationIntent = !!(intentMatch && !state.orchestratorDelegated && !isScanIntent && PHASES[phaseNum as 1|2|3|4|5|6|7|8]);
+      // (2026-10-18 用户实测: 总编写"我这就派角色师执行 Step 3…归拢进设定集", isDelegationPledge=true
+      //  但 intentMatch 词表里没有 角色/设定/建档 → isDelegationIntent=false → 整个接管块被跳过,
+      //  run 直接 done, 设定集永远空。intentMatch 补上这些词, 且 isDelegationPledge 命中时直接算委派意图。)
+      const intentMatch = body.match(/委派|@|\barchitect\b|\bwriter\b|\bdesigner\b|架构师|主笔|总编|拆书|正文|审稿|质检|角色|人设|人物|设定|建档|世界观|档案/i);
+      const isDelegationIntent = !!((intentMatch || isDelegationPledge) && !state.orchestratorDelegated && !isScanIntent && PHASES[phaseNum as 1|2|3|4|5|6|7|8]);
       const isSearchIntent = !isScanIntent && !state.orchestratorDelegated
         && /搜索|搜一下|搜榜|找资料|查资料|联网搜|网络搜|资料员|搜索一下/.test(body || userText);
+      // 拆书意图: "拆书/拆解/解构《XXX》" → 核心工具 analyze_novel 确定性代跑。
+      // (2026-10-18 用户实测: 点名委派拆书走 named 路径 coreTool="", 纯靠子 LLM 自觉,
+      //  子 LLM 只回了句"好, 我来完成..."就一个工具没调 → 终审 0/10 → 打回后也没人返修,
+      //  拆书事实上没发生。有书名就必须让代码层把 analyze_novel 真跑了。)
+      const deconTitle = (
+        userText.match(/《([^》]{1,40})》/)?.[1] ||
+        body.match(/《([^》]{1,40})》/)?.[1] ||
+        ""
+      ).trim();
+      const isDeconstructIntent = !isScanIntent && !isSearchIntent && !!deconTitle
+        && /拆书|拆文|拆解|解构|拉片/.test(bodyText0 + " " + userText);
       if (isScanIntent || isDelegationIntent || isSearchIntent) {
-        const targetAgent = isScanIntent ? "story-architect" : isSearchIntent ? "story-explorer" : PHASES[phaseNum as 1|2|3|4|5|6|7|8].agent as AgentName;
+        // 【承诺型委派要听模型说的那个专家】原本一律按 PHASES[currentPhase].agent 路由,
+        // 但项目 currentPhase 常常停在 1 (扫榜), 而用户/总编要的是"委派主笔写正文" →
+        // 会被硬路由回架构师再扫一次榜, 完全答非所问。模型既然已经在正文里点名了专家,
+        // 就以它点名的为准 (这才是尊重它的决策权), 点不准才回退到阶段表。
+        const named = pledgeTarget(bodyText0);
+        const phaseAgent = PHASES[phaseNum as 1|2|3|4|5|6|7|8]?.agent as AgentName | undefined;
+        const targetAgent = (isScanIntent ? "story-architect" : isSearchIntent ? "story-explorer" : (named || phaseAgent)) as AgentName | undefined;
         if (targetAgent && isValid(targetAgent) && targetAgent !== DEFAULT_AGENT) {
-          const delegateTask = isScanIntent ? "扫榜: 抓取平台真实榜单数据并归纳趋势" : isSearchIntent ? "搜索/资料: 联网检索并整理结果" : `代码层兜底: 执行 Step ${phaseNum}`;
+          // 【承诺委派的话术不能照搬阶段表】以前一律写"代码层兜底: 执行 Step N",
+          // 于是"委派主笔写正文"被代号成 "执行 Step 1 (扫榜调研)", 主笔拿着扫榜的任务真的去扫榜了
+          // → 用户问正文、系统回一份榜单趋势, 答非所问。点名专家时按**用户原文**下发任务。
+          const delegateTask = isScanIntent
+            ? "扫榜: 抓取平台真实榜单数据并归纳趋势"
+            : isSearchIntent
+              ? "搜索/资料: 联网检索并整理结果"
+              : named
+                ? `承诺委派接管: ${userText.slice(0, 120)}`
+                : `代码层兜底: 执行 Step ${phaseNum}`;
           logInfo("[委派兜底] agent=orchestrator " + (isScanIntent ? "检测到扫榜意图, 强制委派到 story-architect (scan_bestseller)" : isSearchIntent ? "检测到搜索/资料意图, 强制委派到 story-explorer" : "正文检测到委派意图(Step "+phaseNum+"), 强制委派到 "+targetAgent));
           emit({ type: "delegate", from: agentName, to: targetAgent, task: delegateTask, depth: depth + 1 });
           emit({ type: "sub_agent_start", agent: targetAgent, task: delegateTask, depth: depth + 1 });
@@ -2687,7 +2971,13 @@ export async function runAgentLoop(state: RunState): Promise<string> {
             4: "generate_outline", 5: "continue_writing", 6: "review_chapter",
             7: "quality_check", 8: "export_project_data",
           };
-          const coreTool = isScanIntent ? "scan_bestseller" : isSearchIntent ? "web_search" : (PHASE_CORE_TOOL[phaseNum] || "");
+          // 【点名专家时不强行代跑阶段核心工具】阶段表给 writer 配的是 continue_writing(需要已有章节),
+          // 而"写第一章"时项目还是 0 章, 强行代跑必然报错。这种情况交给专家自己用工具完成,
+          // 代码层只负责"把任务派出去 + 逼它真的动手"。
+          // 【例外】拆书有明确书名 → analyze_novel 有确定性输入, 必须代跑, 不能靠 LLM 自觉。
+          const coreTool = isScanIntent ? "scan_bestseller" : isSearchIntent ? "web_search"
+            : isDeconstructIntent ? "analyze_novel"
+            : named ? "" : (PHASE_CORE_TOOL[phaseNum] || "");
           const projGenreForTask = proj0?.genre || "";
           // 搜索意图: 任务文本是搜什么; 阶段意图: 文本是阶段说明
           const taskText = coreTool
@@ -2697,11 +2987,25 @@ export async function runAgentLoop(state: RunState): Promise<string> {
               ? `你现在的任务是"联网搜索"。用户想搜的内容 (原文): ${userText.slice(0, 500)}
 
 【强制指令】你必须调用工具 "web_search" (参数 query=用户搜索内容), 然后用工具返回的真实结果整理成中文汇报。严禁不调工具、只口头描述。若工具调用失败, 汇报失败原因。`
+              : isDeconstructIntent
+              ? `你现在的任务是"拆书解构《${deconTitle}》"。请调用工具 "analyze_novel" (参数: title="${deconTitle}"), 基于抓回的真实文本产出完整拆解: 钩子设计 / 节奏把控 / 人设塑造 / 文风特点 / 世界观设定 / 伏笔布局, 并给出具体可借鉴的写作技巧。严禁只回"我来完成"这类启动语, 严禁编造。用户原文: ${userText.slice(0, 300)}`
               : `执行 Step ${phaseNum} (${PHASES[phaseNum as 1|2|3|4|5|6|7|8].name})。
 用户原文: ${userText.slice(0, 500)}
 
 【强制指令】你必须调用工具 "${coreTool}" 完成本阶段核心动作 (参数: ${phaseNum === 1 ? `genre="${projGenreForTask}"` : phaseNum === 5 ? "chapter_id=当前草稿章节" : "按当前阶段需要"}), 然后用工具返回的真实结果整理成中文汇报。严禁不调工具、只口头描述。若工具调用失败, 汇报失败原因。`)
-            : `执行 Step ${phaseNum} (${PHASES[phaseNum as 1|2|3|4|5|6|7|8].name})。用户原文: ${userText.slice(0, 500)}`;
+            : named
+              ? `${userText.slice(0, 500)}
+
+【强制指令】总编已把这件事明确委派给你(${targetAgent}), 由你负责完成。
+你必须调用**你自己的工具**真的动手产出成果 —— 例如写正文就要真的写出正文全文, 做设定就要真的落库。
+严禁只回复"我将要/马上开始/已安排去做"这类执行意向, 严禁复述计划, 严禁把任务推回给总编。
+若某工具因缺少前置数据而失败 (例如没有大纲), 就用现有上下文自行补齐最小前置再继续, 或如实说明卡在哪一步。${targetAgent === "character-designer" ? `
+【建档专项】本任务涉及角色/设定归档, 侧边栏"设定集"只认 add_element 落库的数据:
+1) 每个角色必须调 manage_character(action=add, ...) 建档案;
+2) 每条设定 (角色/世界观/力量体系/金手指/境界…) 必须逐条调 add_element(kind, name, detail) 写进设定集, kind 用 character/worldview/power_system 等;
+3) 回复里必须如实汇报"实际落库 N 条设定 + M 份角色档案"。
+只在正文里描述设定而不调 add_element = 没做, 终审会打回。` : ""}`
+              : `执行 Step ${phaseNum} (${PHASES[phaseNum as 1|2|3|4|5|6|7|8].name})。用户原文: ${userText.slice(0, 500)}`;
           subMsgs.push({ role: "user", content: taskText });
           // === 兜底的兜底: 代码层强制代跑该阶段核心工具 ===
           // 即便子 agent LLM 流式不稳没发出 tool_call, 这里直接调 dispatchTool 把核心动作做完,
@@ -2714,6 +3018,8 @@ export async function runAgentLoop(state: RunState): Promise<string> {
             ? { genre: projGenreForTask || "仙侠", platform: "番茄小说" }
             : isSearchIntent
               ? { query: userText.slice(0, 200), max_results: 10 }
+              : isDeconstructIntent
+                ? { title: deconTitle }
               : phaseNum === 1
                 ? { genre: projGenreForTask || "", platform: "番茄小说" }
                 : phaseNum === 4
@@ -2737,11 +3043,22 @@ export async function runAgentLoop(state: RunState): Promise<string> {
             subResult = "";
           }
           // LLM 子循环竞态: LLM 卡 TLS/429 时在超时点用代跑结果出卡片 (不等 LLM)
-          // 总预算 30s: 前 15s 等 LLM, 后 15s 等代跑工具 (代跑内嵌 LLM 归纳已硬超时 25s 兜底)
-          const SUB_LLM_BUDGET_MS = 15_000;
+          // 注意预算取舍: 核心工具已由代码层代跑完 (上面 dispatchTool), 这里只是等 LLM 把工具结果
+          // 整理成"人话汇报"。旧值 15s 太紧 —— 带 tool_call 的长回答 15s 内基本吐不完, 必然落到
+          // 代跑兜底, 用户体感就是"长任务里模型连不上/没启用"。
+          // 默认放宽到 45s, 可用环境变量 TIANYAN_SUB_LLM_BUDGET_MS 覆盖。
+          const SUB_LLM_BUDGET_MS = Number(process.env.TIANYAN_SUB_LLM_BUDGET_MS) || 45_000;
+          // 记录子 agent 到底调没调工具 — 光有文本不算交付 (实测会只回一句"好, 我来完成...").
+          // 返修判定要用: 0 工具 + 启动语文本 = 空话, 必须返修, 不能指望终审 LLM 每次都抓到。
+          const subToolsUsed = new Set<string>();
+          const subEmit: typeof emit = (evt) => {
+            const t = (evt as { tool?: string }).tool;
+            if ((evt.type === "step" || evt.type === "observation") && t) subToolsUsed.add(t);
+            emit(evt);
+          };
           const subLoopPromise = runAgentLoop({
             pid, agentName: targetAgent, messages: subMsgsProbe,
-            depth: depth + 1, runId: subRunId, delegationLog: state.delegationLog, emit,
+            depth: depth + 1, runId: subRunId, delegationLog: state.delegationLog, emit: subEmit,
           });
           const timeoutPromise = new Promise<string>((resolve) =>
             setTimeout(() => resolve(""), SUB_LLM_BUDGET_MS)
@@ -2751,9 +3068,17 @@ export async function runAgentLoop(state: RunState): Promise<string> {
           // LLM 在预算内没出结果 → 立刻用代跑结果出卡片 (sub_answer), 不再等
           // 429/限流时 LLM 子循环会熔断, 这里立即用代跑结果快出, 不卡 15s
           if (!llmResult.trim()) {
+            // 没核心工具可代跑 + LLM 也没出结果 → 没有任何东西可交付。
+            // 别发空卡片糊弄: 如实告知 orchestrator, 让它在汇报里说明 (2026-10-18 拆书实测踩过)
+            if (!subResult.trim()) {
+              logWarn("[子agent快出] " + targetAgent + " 无 coreTool 且 LLM 无产出, 交付为空, 不出卡片");
+              messages.push({ role: "user", content: `[系统指令] 委派给 ${targetAgent} 的任务「${delegateTask}」本轮没有产出任何东西 (专家 LLM 无响应, 且无确定性工具可代跑)。请如实告知用户该任务本轮失败、建议重试, 不要编造结果, 不要把这次委派说成已完成。` });
+              state.orchestratorDelegated = true;
+              continue;
+            }
             logInfo("[子agent快出] " + targetAgent + " LLM " + SUB_LLM_BUDGET_MS/1000 + "s 内未出结果, 用代跑工具结果直接出卡片");
             const subDurEarly = Date.now() - t0fb;
-            const earlyLabel = isScanIntent ? "扫榜" : isSearchIntent ? "搜索/资料" : `兜底 Step ${phaseNum}`;
+            const earlyLabel = isScanIntent ? "扫榜" : isSearchIntent ? "搜索/资料" : isDeconstructIntent ? `拆书《${deconTitle}》` : `兜底 Step ${phaseNum}`;
             autoAdvancePhase(pid, emit);
             state.delegationLog.push({ to: targetAgent, task: earlyLabel + " (快出)", result: subResult, durationMs: subDurEarly });
             // B-3 总编终审: 快出路径产出出门前总编读一遍 (不背书→总编修订版才出门)
@@ -2777,12 +3102,39 @@ export async function runAgentLoop(state: RunState): Promise<string> {
             continue; // orchestrator 基于代跑结果继续 (LLM 子循环仍在后台跑, 后续轮次可补充 LLM 分析)
           }
           const subDur = Date.now() - t0fb;
-          const fallbackLabel = isScanIntent ? "扫榜" : isSearchIntent ? "搜索/资料" : `兜底 Step ${phaseNum}`;
+          const fallbackLabel = isScanIntent ? "扫榜" : isSearchIntent ? "搜索/资料" : isDeconstructIntent ? `拆书《${deconTitle}》` : `兜底 Step ${phaseNum}`;
           autoAdvancePhase(pid, emit);
           state.delegationLog.push({ to: targetAgent, task: fallbackLabel, result: subResult, durationMs: subDur });
-          // B-3 总编终审: 委派兜底路径产出出门前总编读一遍
-          const finalR_fb = await finalReviewDeliverable(pid, runId, targetAgent, fallbackLabel, subResult, emit);
+          // B-3 总编终审 + 返修闭环: 打回不再是终点 —— 带着修改指令让同一个专家重跑一轮再终审。
+          // 以前的断链: 裁决意见只被附在文本末尾, 从未送回专家, run 直接结束 (用户: "拆完书就没下文了")。
+          const reworkOnce = async (feedback: string): Promise<string> => {
+            const retryMsgs: Array<{ role: string; content: string }> = [...subMsgsProbe];
+            if (llmResult.trim()) retryMsgs.push({ role: "assistant", content: llmResult.slice(0, 2000) });
+            // 第一轮已经代跑出的真实工具数据直接喂给返修轮, 不重复跑 (扫榜一次要 60s+)
+            if (coreTool && subResult.trim()) {
+              retryMsgs.push({ role: "user", content: `【第一轮工具真实数据已就绪, 无需重复调用】\n${subResult.slice(0, 4000)}` });
+            }
+            retryMsgs.push({ role: "user", content: `【总编终审打回 · 返修指令】\n${feedback}\n\n这次必须真的产出完整成果${coreTool ? " (基于上面的真实工具数据写成完整汇报)" : " —— 调用你自己的工具真的动手, 写正文就要真的写出正文"}。严禁只回"我将要/马上开始"这类启动语, 严禁复述计划, 严禁把任务推回给总编。` });
+            logInfo(`[终审返修] ${targetAgent} 带修改指令重跑 (${fallbackLabel})`);
+            const retryText = await Promise.race([
+              runAgentLoop({
+                pid, agentName: targetAgent, messages: retryMsgs,
+                depth: depth + 1, runId: subRunId, delegationLog: state.delegationLog, emit: subEmit,
+              }),
+              new Promise<string>((resolve) => setTimeout(() => resolve(""), SUB_LLM_BUDGET_MS)),
+            ]);
+            if (!retryText.trim()) return "";
+            const base = coreTool && subResult.trim() ? subResult : "";
+            return base ? base + "\n\n【返修汇报】\n" + retryText : "【返修汇报】\n" + retryText;
+          };
+          const finalR_fb = await finalReviewWithRework(pid, runId, targetAgent, fallbackLabel, subResult, emit, reworkOnce, 1);
           if (!finalR_fb.approved) subResult = finalR_fb.content + "\n\n[终审裁决: " + finalR_fb.verdict.slice(0, 150) + "]";
+          else if (finalR_fb.reworked > 0) subResult = finalR_fb.content; // 返修通过 → 用返修版
+          // 空话兜底: 终审通过了, 但专家全程 0 工具且只有启动语 → 诚实标注, 不伪装成交付
+          else if (subToolsUsed.size === 0 && !coreTool && subResult.trim().length < 300) {
+            subResult = subResult + "\n\n⚠️ [系统标注] 该专家本轮未调用任何工具, 以上只是口头应承, 实际成果未产出。可重发指令让其重试。";
+            logWarn(`[空话兜底] ${targetAgent} 0 工具 + ${subResult.trim().length} 字短文本, 已标注`);
+          }
           emit({ type: "delegate_done", from: agentName, to: targetAgent, task: fallbackLabel, result: subResult, durationMs: subDur });
           emit({ type: "sub_answer", agent: targetAgent, text: subResult });
           emit({ type: "sub_agent_done", agent: targetAgent, result: subResult, durationMs: subDur });
@@ -2909,9 +3261,23 @@ export async function runAgentLoop(state: RunState): Promise<string> {
           const subDur = Date.now() - subT0;
           let subResult2 = subResult;
           state.delegationLog.push({ to: target, task, result: subResult2, durationMs: subDur });
-          // B-3 总编终审: 正常委派路径产出出门前总编读一遍
-          const finalR_norm = await finalReviewDeliverable(pid, runId, target as AgentName, task.slice(0, 60), subResult2, emit);
+          // B-3 总编终审 + 返修闭环: 打回 → 同一专家带修改指令重跑一轮 → 再终审 (最多 1 轮)。
+          // 以前裁决意见只附在文本末尾就交付, 专家永远不知道自己被打回了 → "审完就没下文"。
+          const reworkNorm = async (feedback: string): Promise<string> => {
+            const retryMsgs: Array<{ role: string; content: string }> = [...subMsgs];
+            if (subResult.trim()) retryMsgs.push({ role: "assistant", content: subResult.slice(0, 2000) });
+            retryMsgs.push({ role: "user", content: `【总编终审打回 · 返修指令】\n${feedback}\n\n这次必须真的调用你的工具产出完整成果。严禁只回"我将要/马上开始"这类启动语, 严禁复述计划, 严禁把任务推回给总编。` });
+            logInfo(`[终审返修] ${target} 带修改指令重跑 (${task.slice(0, 40)})`);
+            const REWORK_BUDGET_MS = Number(process.env.TIANYAN_REWORK_BUDGET_MS) || 120_000;
+            const retry = await Promise.race([
+              runAgentLoop({ pid, agentName: target as AgentName, messages: retryMsgs, depth: depth + 1, runId, delegationLog: state.delegationLog, emit }),
+              new Promise<string>((resolve) => setTimeout(() => resolve(""), REWORK_BUDGET_MS)),
+            ]);
+            return retry.trim();
+          };
+          const finalR_norm = await finalReviewWithRework(pid, runId, target as AgentName, task.slice(0, 60), subResult2, emit, reworkNorm, 1);
           if (!finalR_norm.approved) subResult2 = finalR_norm.content + "\n\n[终审裁决: " + finalR_norm.verdict.slice(0, 150) + "]";
+          else if (finalR_norm.reworked > 0) subResult2 = finalR_norm.content;
           emit({ type: "delegate_done", from: agentName, to: target as AgentName, task, result: subResult2, durationMs: subDur });
           emit({ type: "sub_answer", agent: target as AgentName, text: subResult2 });
           emit({ type: "sub_agent_done", agent: target as AgentName, result: subResult2, durationMs: subDur });
@@ -3202,9 +3568,22 @@ export async function runAgentLoop(state: RunState): Promise<string> {
       const legacyHint = isOrchClose
         ? `\n\n[系统指令] 该阶段产出的数据已完成。你现在必须【直接输出】面向用户的中文汇报正文 (总结该专家做了什么、关键结论), 末尾询问是否进入下一阶段。禁止只输出思考、禁止再调用工具、禁止委派下一步。若模型倾向把汇报写进 reasoning, 请把正文放进 content。`
         : "";
-      // B-3 总编终审: legacy 委派路径产出出门前总编读一遍
-      const finalR_legacy = await finalReviewDeliverable(pid, runId, target as AgentName, task.slice(0, 60), subResult2, emit);
+      // B-3 总编终审 + 返修闭环: 打回 → 同一专家带修改指令重跑一轮 → 再终审 (最多 1 轮)
+      const reworkLegacy = async (feedback: string): Promise<string> => {
+        const retryMsgs: Array<{ role: string; content: string }> = [...subMessages];
+        if (subResult.trim()) retryMsgs.push({ role: "assistant", content: subResult.slice(0, 2000) });
+        retryMsgs.push({ role: "user", content: `【总编终审打回 · 返修指令】\n${feedback}\n\n这次必须真的调用你的工具产出完整成果。严禁只回"我将要/马上开始"这类启动语, 严禁复述计划, 严禁把任务推回给总编。` });
+        logInfo(`[终审返修] ${target} 带修改指令重跑 (${task.slice(0, 40)})`);
+        const REWORK_BUDGET_MS = Number(process.env.TIANYAN_REWORK_BUDGET_MS) || 120_000;
+        const retry = await Promise.race([
+          runAgentLoop({ pid, agentName: target as AgentName, messages: retryMsgs, depth: depth + 1, runId, delegationLog: state.delegationLog, emit }),
+          new Promise<string>((resolve) => setTimeout(() => resolve(""), REWORK_BUDGET_MS)),
+        ]);
+        return retry.trim();
+      };
+      const finalR_legacy = await finalReviewWithRework(pid, runId, target as AgentName, task.slice(0, 60), subResult2, emit, reworkLegacy, 1);
       if (!finalR_legacy.approved) subResult2 = finalR_legacy.content + "\n\n[终审裁决: " + finalR_legacy.verdict.slice(0, 150) + "]";
+      else if (finalR_legacy.reworked > 0) subResult2 = finalR_legacy.content;
       state.delegationLog.push({ to: target, task, result: subResult2, durationMs: durMs });
       emit({ type: "delegate_done", from: agentName, to: target as AgentName, task, result: subResult2, durationMs: durMs });
       emit({ type: "sub_answer", agent: target as AgentName, text: subResult2 });

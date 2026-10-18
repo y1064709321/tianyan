@@ -62,10 +62,30 @@ let _configPath = "";
 
 function loadYaml(path: string): Record<string, unknown> {
   if (!existsSync(path)) return {};
+  const raw = readFileSync(path, "utf-8");
   try {
-    const raw = readFileSync(path, "utf-8");
     return (parseYaml(raw) as Record<string, unknown>) || {};
   } catch {
+    // === 逃生网: Windows 路径被写成 double-quoted 标量时, \U / \l 等是非法 YAML 转义,
+    //     parse 抛错 → 旧代码静默 return {} → 【全部配置重置】(默认模型/端口/模型池全丢)。
+    //     这是"前端显示 Agnes/DeepSeek 不是我配的那个"的根因之一。
+    //     这里先按"双引号 Windows 路径 → 单引号(不解析转义)"修复后重试;
+    //     仍失败才返回 {}, 并明确打日志 (不再静默吞掉)。
+    try {
+      const repaired = raw.replace(
+        /(:\s*)"((?:[A-Za-z]:)?[^"\n]*\\[^"\n]*)"/g,
+        (_m, head: string, val: string) => `${head}'${val}'`,
+      );
+      const parsed = parseYaml(repaired) as Record<string, unknown> | null;
+      if (parsed && typeof parsed === "object") {
+        console.warn(
+          `[config] ${path} 存在非法 YAML 转义 (疑似 Windows 路径用了双引号), 已就地修复解析。` +
+          ` 建议重启一次让本进程用正确格式回写该文件或改单引号。`,
+        );
+        return parsed || {};
+      }
+    } catch { /* 修复失败, 落到下面 */ }
+    console.warn(`[config] ${path} 解析失败且无法修复, 本次启动将使用默认配置 (请检查文件内容)`);
     return {};
   }
 }
@@ -102,7 +122,11 @@ export function loadSettings(configPath?: string): Settings {
   const envKey = process.env.TIANYAN_API_KEY || process.env.AGNES_API_KEY || undefined;
   const envModel = process.env.TIANYAN_MODEL || undefined;
   const models = ((raw.models as Record<string, unknown>[]) || []).map(modelFromDict);
-  if (models.length === 0) models.push(defaultModel);
+  // ★ 默认模型必须同时在 models 列表里。配置文件把 default_model 和 models 分开存,
+  //   旧逻辑只在 models 为空时才塞入 default → 一旦 models 非空, defaultModel 就不在列表里,
+  //   所有 `s.models.find(id)` 的代码都找不到它 (拿不到 apiBase/apiKey),
+  //   于是"一键拉取模型/按 provider 取 key"直接退化到 OpenAI 默认 base → 拉取必然失败。
+  if (!models.some((m) => m.model === defaultModel.model)) models.unshift(defaultModel);
   if (envKey) {
     defaultModel.apiKey = envKey;
     for (const m of models) m.apiKey = envKey;

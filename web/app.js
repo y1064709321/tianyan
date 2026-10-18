@@ -731,6 +731,54 @@ const KIND_META = {
 };
 const FILE_ICON = { chapter: "📄", source: "📚" };
 
+/**
+ * 会改变项目数据的工具 —— 执行完必须把项目拉回来重渲染, 否则用户看不到产出。
+ *
+ * 为什么是白名单而不是"每次 observation 都刷": 一轮里可能有十几个只读工具
+ * (query_project / web_search / scan_bestseller…), 全刷会造成请求风暴。
+ * 但白名单里漏一个, 表现就是"后端跑完了页面不动, 必须手动刷新" ——
+ * 历史上就是因为名单里只有 4 个设定类工具, 写正文的 continue_writing 不在里面才出的问题。
+ * 【新增写库工具时必须同步加到这里】
+ */
+const MUTATING_TOOLS = /^(continue_writing|ghostwrite|generate_outline|manage_outline|review_chapter|quality_check|challenge_review|resolve_challenge|add_element|manage_character|manage_world|manage_milestone|adjust_arc)$/;
+
+// 防抖: 一轮里连跑好几个写库工具, 合并成一次请求 (400ms 内只发最后一次)
+let _refreshTimer = null;
+function scheduleProjectRefresh() {
+  if (_refreshTimer) clearTimeout(_refreshTimer);
+  _refreshTimer = setTimeout(() => {
+    _refreshTimer = null;
+    refreshProjectData();
+  }, 400);
+}
+
+/** 拉最新项目数据 → 重渲染文件树; 章节抽屉开着则连内容一起更新 */
+async function refreshProjectData() {
+  if (!currentProject) return;
+  try {
+    const p = await api(`/api/projects/${currentProject.id}`);
+    if (!p || !currentProject) return;
+    currentProject.chapters = p.chapters || [];
+    currentProject.elements = p.elements || [];
+    currentProject.meta = p.meta || currentProject.meta;
+    renderTree();
+    // 章节抽屉正开着 → 内容也要跟着更新, 否则抽屉里还是旧正文。
+    // 但如果用户正在编辑 (编辑框可见), 绝不能覆盖, 会把人写到一半的内容冲掉。
+    const drawer = $("#drawer");
+    const editing = $("#drawer-edit-area") && !$("#drawer-edit-area").classList.contains("hidden");
+    if (drawer && drawer.classList.contains("open") && drawerChapterId && !editing) {
+      const ch = (p.chapters || []).find((c) => c.id === drawerChapterId);
+      if (ch) {
+        $("#drawer-title").textContent = ch.title;
+        $("#drawer-body").innerHTML =
+          `<h3>梗概</h3>${esc(ch.outline || "(无)")}` +
+          `<h3>正文 (${(ch.content || "").length} 字)</h3>${esc(ch.content || "(尚未撰写)")}`;
+        $("#drawer-edit-area").value = ch.content || "";
+      }
+    }
+  } catch { /* 刷新失败不影响主流程 */ }
+}
+
 function renderTree() {
   const tree = $("#tree");
   if (!currentProject) {
@@ -1239,13 +1287,27 @@ function appendSystemNotice(content) {
   scrollChat();
 }
 
+// 滚动跟随策略 (2026-10-18 修): 以前每次调用时算一次 gap, 思考面板/子agent卡片
+// 一次能长好几百 px → gap 瞬间超阈值 → 视图永远停在老位置, 新内容来了不跟底,
+// 用户只能手动从最顶端往下翻着找。正确做法: 持续跟踪"用户是否主动上翻"这个状态 —
+// 没上翻就永远跟底 (新内容从底端顶上来, 旧内容往上走); 上翻阅读时才不打扰,
+// 用户滚回底部后自动恢复跟随。
+let userPinnedUp = false;
 function scrollChat(force) {
   const c = $("#chat");
   if (!c) return;
-  // 用户上翻阅读时不拽回底部 (打字机每字都调用); 新消息/新气泡由调用方传 force=true
-  const gap = c.scrollHeight - c.scrollTop - c.clientHeight;
-  if (force || gap < 160) c.scrollTop = c.scrollHeight;
+  if (force) userPinnedUp = false; // 新消息/新气泡: 强制跟底并解除上翻状态
+  if (!userPinnedUp) c.scrollTop = c.scrollHeight;
 }
+// 跟踪用户滚动: 离底超过 160px 才算"主动上翻阅读"; 回到底部自动恢复跟随
+(() => {
+  const c = $("#chat");
+  if (!c) return;
+  c.addEventListener("scroll", () => {
+    const gap = c.scrollHeight - c.scrollTop - c.clientHeight;
+    userPinnedUp = gap > 160;
+  }, { passive: true });
+})();
 
 // ===== 回放模式: 断线重放/历史重建时, 打字机瞬时完成, 且抑制 toast/阶段确认按钮等实时交互 =====
 let REPLAY_MODE = false;
@@ -1263,6 +1325,8 @@ function flushPendingThink(target) {
 // 冲刷回答打字机残留: 一次性渲染全部队列文本
 function flushAnswerInstant(target) {
   if (!target) return;
+  // 回放/断线重放: 正文一次性落盘时同样自动折叠思考面板
+  if (target.answerQueue && target.answerQueue.length > 0) autoCollapseThink(target);
   const q = target.answerQueue || "";
   target.answerShown = q.length;
   if (q) {
@@ -1332,6 +1396,80 @@ function cacheChatMessages(pid) {
   } catch {}
 }
 
+// ===================== 发送/停止二合一按钮 + 任务取消 =====================
+// 用户拍板「暂停跟发送合在一起」:
+//   空闲 = 纸飞机(发送); 任务跑着且输入框为空 = 方块(停止, 真停后端 run);
+//   输入框里有字 = 仍是发送(发送时会先静默停掉上一个 run)。
+// 后端取消是协作式的 (runner 在轮间/流式 chunk 间检查 isRunCancelled), 所以点了之后
+// 最快当轮结束就停, 最坏等当前这一次 LLM 调用返回 (不会硬杀 HTTP, 避免半截写库)。
+let chatActive = false;       // 是否有 /chat 正在跑
+let activeChatAbort = null;   // 当前 /chat 请求的 AbortController (兜底硬断)
+let chatStreamDone = false;   // 当前流是否已收到 done/fatal error
+let userStopped = false;      // 本次结束是否由用户点停止触发
+let chatSeq = 0;              // 任务序号: 防止"上一个任务"的收尾把新任务的按钮状态改掉
+
+/** 任务状态 / 输入框内容一变就调它: 决定按钮显示"发送"还是"停止" */
+function updateComposerBtn() {
+  const btn = $("#send-btn");
+  if (!btn) return;
+  const plane = $("#send-icon-plane"), stop = $("#send-icon-stop");
+  // 任务跑着 且 输入框是空的 → 按钮是"停止"; 其余情况都是"发送"
+  const showStop = chatActive && !($("#input") && $("#input").value.trim());
+  btn.classList.toggle("stopping", showStop);
+  btn.title = showStop ? "停止当前任务" : "发送";
+  if (plane) plane.classList.toggle("hidden", showStop);
+  if (stop) stop.classList.toggle("hidden", !showStop);
+}
+/** 只有"当前最新那个任务"才有权收尾 (改按钮/abort 状态) */
+function isCurrentChat(seq) {
+  return seq === chatSeq;
+}
+
+/** 等 runId 到位: 刚 POST 完后端还没 createRun, 此时点停止拿不到 id */
+async function awaitRunId(maxWait = 5000) {
+  const t0 = Date.now();
+  while (!window.__currentRunId && Date.now() - t0 < maxWait) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return window.__currentRunId;
+}
+
+/**
+ * 取消当前 run。silent=true 时不弹提示 (用于"发新消息前自动停掉上一个任务")。
+ * @returns {Promise<boolean>} 是否真的发出了取消请求
+ */
+async function stopActiveRun(silent = false) {
+  const runId = window.__currentRunId || (await awaitRunId(1500));
+  if (!runId) return false;
+  try {
+    const res = await fetch(`/api/runs/${runId}/cancel`, { method: "POST" });
+    const j = await res.json().catch(() => null);
+    if (!silent) {
+      if (j && j.alreadyFinished) toast(`任务已结束 (${j.status || "done"})`, "ok");
+      else toast("已请求停止, 当前步骤结束后立即停下", "ok");
+    }
+    return !!(j && j.cancelled);
+  } catch (e) {
+    if (!silent) toast("停止失败: " + (e && e.message || e), "warn");
+    return false;
+  }
+}
+
+/** 停止态点击: 后端取消 + 8s 兜底硬断前端连接 */
+async function onStopBtnClick() {
+  if (!chatActive) { updateComposerBtn(); return; }
+  userStopped = true;
+  const ok = await stopActiveRun(false);
+  // 后端协作式取消一般几秒内发 done 收尾; 万一卡住 (LLM 长连接没返回), 前端 8s 后硬断,
+  // 此时后端已标记 cancelled, 不会再继续烧 token。
+  setTimeout(() => {
+    if (!chatStreamDone && activeChatAbort) {
+      try { activeChatAbort.abort(); } catch {}
+    }
+  }, 8000);
+  return ok;
+}
+
 async function send(text) {
   if (!currentProject) {
     toast("请先创建或选择一个项目", "warn");
@@ -1342,6 +1480,16 @@ async function send(text) {
   }
   text = text || $("#input").value.trim();
   if (!text) return;
+  // 发送时还在录音 → 停掉, 不然识别结果会继续追加到已清空的输入框, 用户困惑
+  if (typeof voiceActive !== "undefined" && voiceActive) stopVoice(false);
+
+  // 上一条还在跑 → 先停掉它。否则两个 run 同时写同一个项目,
+  // 章节正文 / 大纲会被后跑完的那个覆盖, 且两份 token 一起烧。
+  if (chatActive) {
+    await stopActiveRun(true);
+    toast("已停止上一个任务, 开始处理新指令", "ok", 2500);
+  }
+
   $("#input").value = "";
   autoGrow();
   appendMessage("user", text);
@@ -1352,7 +1500,16 @@ async function send(text) {
   const assistant = appendMessage("assistant", "", true);
   let streamCompleted = false;
 
+  // 新任务开始: 重置 runId (避免残留上一个 run 的 id 让「停止」点错对象), 按钮切成停止态
+  const mySeq = ++chatSeq;
+  window.__currentRunId = null;
+  chatActive = true;
+  chatStreamDone = false;
+  userStopped = false;
+  updateComposerBtn();
+
   async function attemptFetch() {
+    activeChatAbort = new AbortController();
     const res = await fetch(`/api/projects/${currentProject.id}/chat`, {
       method: "POST",
       headers: {
@@ -1362,6 +1519,8 @@ async function send(text) {
       body: JSON.stringify({ input: text, agent: "orchestrator" }),
       // keepalive 让长连接更稳定 (沙箱预览环境下减少被中断概率)
       keepalive: true,
+      // 兜底: 后端取消 8s 没响应时前端硬断 (见 onStopBtnClick)
+      signal: activeChatAbort.signal,
     });
     if (!res.ok) {
       throw new Error(`HTTP ${res.status}`);
@@ -1405,10 +1564,12 @@ async function send(text) {
         try { evt = JSON.parse(trimmed.slice(6)); } catch { continue; }
         handleEvent(evt, assistant);
         // done 事件: 正常完成
-        if (evt.type === "done") streamCompleted = true;
+        if (evt.type === "done") { streamCompleted = true; chatStreamDone = true; }
         // 致命 error (fatal 未标或 fatal=true): 标记完成, 后续断连不报错
         // 非致命 error (fatal=false): 后端会继续发数据, 不标记完成, 不断连
-        if (evt.type === "error" && evt.fatal !== false) streamCompleted = true;
+        if (evt.type === "error" && evt.fatal !== false) { streamCompleted = true; chatStreamDone = true; }
+        // 后端被取消后也会发 done(status=cancelled), 那时按钮切回发送态
+        if (isCurrentChat(mySeq) && (evt.type === "done" || (evt.type === "error" && evt.fatal !== false))) updateComposerBtn();
       }
     }
   }
@@ -1424,13 +1585,12 @@ async function send(text) {
       hideThinkPanel();
       return;
     }
-    const RETRYABLE = /(heartbeat_timeout|fetch|network|ECONNRESET|timeout|stream)/i;
-    if (!RETRYABLE.test(e.message)) {
-      // 非重连错误: 保留内容, 轻量提示
-      const tip = document.createElement("div");
-      tip.className = "stream-tip";
-      tip.textContent = "（连接已断开，上方内容已保留）";
-      assistant.el.appendChild(tip);
+    // 用户点了停止 → 别走重连逻辑 (那会把已取消的 run 又等回来), 直接收尾
+    if (userStopped) {
+      const tipS = document.createElement("div");
+      tipS.className = "stream-tip";
+      tipS.textContent = "（已按你的要求停止）";
+      assistant.el.appendChild(tipS);
       removeThinkingSpinner(assistant);
       hideThinkPanel();
       return;
@@ -1438,27 +1598,33 @@ async function send(text) {
     // ===== 断线处理铁律: 绝不重发 POST /chat =====
     // 旧版重连 = 重新 POST → 后端 createRun 重跑整个任务 (重扫榜/重写章节/重复烧 token),
     // 且旧 run 在后台并没停 → 两个 run 同时写库。正确姿势: 轮询 resume 等后台跑完, 清场后瞬时重放。
-    const awaitRunId = async (maxWait = 5000) => {
-      const t0 = Date.now();
-      while (!window.__currentRunId && Date.now() - t0 < maxWait) await new Promise(r => setTimeout(r, 100));
-      return window.__currentRunId;
-    };
+    //
+    // 【2026-10-17 修复】不再有 RETRYABLE 白名单: 用户主诉"断线后内容不更新, 必须刷新网页"。
+    // 旧代码只认 fetch/network/timeout 这几种错误才恢复, 其余 (terminated / aborted / HTTP xxx…)
+    // 直接显示"连接已断开, 上方内容已保留"就**永远不再拉了** —— 后台明明还在跑, 前端却装死。
+    // 正确做法: 不管断线原因是什么, 只要拿到了 runId 就轮询 resume 把后台结果拉回来;
+    // 只有连 runId 都没有 (POST 阶段就挂了) 才真的没法恢复。
     const runId = await awaitRunId();
     if (!runId) {
       const tip0 = document.createElement("div");
       tip0.className = "stream-tip";
-      tip0.textContent = "（连接已断开，上方内容已保留，可稍后重试）";
+      tip0.textContent = "（连接失败，本条消息未送达，请重新发送）";
       assistant.el.appendChild(tip0);
       removeThinkingSpinner(assistant);
       hideThinkPanel();
       return;
     }
-    setThinkingSpinner(assistant, "连接中断 · 等待后台执行完成…");
-    const POLL_INTERVAL = 15000;
-    const MAX_POLLS = 40; // 最长等 10 分钟 (长章节写作足够)
+    setThinkingSpinner(assistant, "连接中断 · 正在恢复…");
+    // 渐进式轮询: 前 10 次每 3s (断线瞬间就要尽快拉回, 用户盯着屏幕等),
+    // 之后 15s 一次, 最长约 10 分钟 (长章节写作足够)
+    const MAX_POLLS = 40;
+    let waitedMs = 0;
     let replayed = false;
+    let cancelledByBackend = false;
     for (let i = 1; i <= MAX_POLLS && !replayed; i++) {
-      await new Promise(r => setTimeout(r, POLL_INTERVAL));
+      const interval = i <= 10 ? 3000 : 15000;
+      await new Promise(r => setTimeout(r, interval));
+      waitedMs += interval;
       let resumeResp;
       try {
         resumeResp = await fetch(`/api/projects/${currentProject.id}/runs/${runId}/resume`);
@@ -1467,10 +1633,11 @@ async function send(text) {
       if (ct.includes("application/json")) {
         const st = await resumeResp.json().catch(() => null);
         if (st && st.status === "running") {
-          setThinkingSpinner(assistant, `连接中断 · 后台仍在执行 (已等待 ${i * POLL_INTERVAL / 1000}s)…`);
+          setThinkingSpinner(assistant, `连接中断 · 后台仍在执行 (已等待 ${Math.round(waitedMs / 1000)}s)…`);
           continue;
         }
-        break; // 404 等异常: 放弃
+        if (st && st.status === "cancelled") { cancelledByBackend = true; }
+        break; // 404 / cancelled / 其它异常: 放弃
       }
       // SSE 回放: run 已结束 → 清场 → 瞬时重放全量事件
       removeThinkingSpinner(assistant);
@@ -1489,16 +1656,35 @@ async function send(text) {
       } finally { REPLAY_MODE = false; }
       streamCompleted = true;
       replayed = true;
+      toast("连接已恢复, 后台结果已同步", "ok", 2500);
+      // 断线期间工具写入的数据 (章节/大纲/设定) 也要立刻刷新, 不然还是得手动 F5
+      scheduleProjectRefresh();
     }
     removeThinkingSpinner(assistant);
-    if (!replayed) {
+    if (cancelledByBackend) {
+      const tipC = document.createElement("div");
+      tipC.className = "stream-tip";
+      tipC.textContent = "（任务已被停止）";
+      assistant.el.appendChild(tipC);
+    } else if (!replayed) {
       // 等待超时: 不重复执行, 告知用户后台还在跑, 刷新即可看到结果
       const finalTip = document.createElement("div");
       finalTip.className = "stream-tip";
-      finalTip.textContent = "（连接中断，任务仍在后台执行，稍后重新打开本项目即可看到完整结果）";
+      finalTip.textContent = "（连接中断，任务仍在后台执行，稍后会自动同步，或重新打开本项目查看）";
       assistant.el.appendChild(finalTip);
+      // 就算超时也把目前已经落库的内容刷出来 (写了一半的章节也能看到)
+      scheduleProjectRefresh();
     }
     hideThinkPanel();
+  } finally {
+    // 无论正常完成 / 报错 / 用户停止, 按钮都必须切回发送态。
+    // 用序号守卫: 用户可能已经发了新任务, 那时旧任务的收尾不许动新任务的状态。
+    if (isCurrentChat(mySeq)) {
+      chatActive = false;
+      activeChatAbort = null;
+      chatStreamDone = true;
+      updateComposerBtn();
+    }
   }
 }
 
@@ -1612,6 +1798,26 @@ function toggleSubThink(btn) {
     if (!panel.classList.contains("collapsed")) panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }
 }
+// ===== 思考过程自动折叠 (2026-10-18, 用户要求) =====
+// 以前思考面板**默认展开且永不自动收起**: 正文都开始往外流了, 思考过程还敞着一大坨,
+// 把正文顶得看不见。规则: 正文开始输出 (打字机第一帧 / 回放冲刷) → 该气泡的思考面板自动收起,
+// 只留"思考过程 ▸"小条, 想看再点开。每个 target 只自动收一次 (用户手动展开过的不反复收)。
+function autoCollapseThink(target) {
+  if (!target || target._thinkAutoCollapsed) return;
+  target._thinkAutoCollapsed = true;
+  let panel = target.thinkPanel || null;
+  if (!panel && target.el) {
+    const wrap = target.el.closest(".sub-agent-wrapper") || target.el.closest(".msg");
+    if (wrap) panel = wrap.querySelector(".sub-think-panel");
+  }
+  if (!panel || panel.classList.contains("collapsed")) return;
+  panel.classList.add("collapsed");
+  // 同步 toggle 箭头方向 (expanded → 收起)
+  const container = panel.parentElement;
+  const toggle = container && container.querySelector(".sub-think-toggle, .sub-think-toggle-inline");
+  if (toggle) toggle.classList.remove("expanded");
+}
+
 // 统一思考打字机: 边收边播, 自然节奏 (基础1字/26ms + 标点停顿, 约35字/秒)
 function startThinkTypewriter(target) {
   const el = target.curThinkText;
@@ -1651,6 +1857,8 @@ window.startThinkTypewriter = startThinkTypewriter;
 
 // 回答正文打字机: 气泡内容也逐字打出 (边收边播, 与思考同节奏但略快)
 function startAnswerTypewriter(target) {
+  // 正文开始往外流 → 思考过程自动折叠 (用户: "思考过程不会自动折叠")
+  autoCollapseThink(target);
   // 回放模式不逐字播 (answer_end/done 处 flushAnswerInstant 一次性渲染)
   if (REPLAY_MODE) return;
   if (target._ansAnim) return;
@@ -2304,6 +2512,8 @@ function handleEvent(evt, assistant) {
       entry.answerWrap.innerHTML = html;
       // 正文出框外 → 子 agent 执行态切 "思考过程" (spinner 停, 可点开看步骤)
       setSubThinkingState(entry, false);
+      // 子 agent 直写路径同样自动折叠思考面板
+      autoCollapseThink(entry);
       // 执行过程状态切到 "已完成"
       const statusEl = entry.el.querySelector(".sub-process-status");
       if (statusEl) statusEl.textContent = "已完成";
@@ -2526,17 +2736,14 @@ function handleEvent(evt, assistant) {
         const mainQ = getToolQueue(assistant, "orchestrator");
         if (mainQ.length === 0) setMainThinkingState(assistant, false);
       }
-      // 设定类工具执行后实时刷新侧边栏
+      // 【产出后必须实时可见】任何写库工具执行完都要把项目数据拉回来重渲染 ——
+      // 旧代码只刷了 4 个"设定类"工具 (add_element/manage_character/manage_world/manage_milestone),
+      // 而 continue_writing(写正文) / generate_outline(大纲) / review_chapter(改状态) 这些
+      // **真正产出内容的工具一个都没刷** → 后端跑完了但页面纹丝不动, 用户只能手动 F5 才看得到。
+      // 改成白名单 + 防抖: 一轮里连跑好几个写库工具也只合并成一次请求。
       const _tool = evt.tool || "";
-      if ((_tool === "add_element" || _tool === "manage_character" || _tool === "manage_world" || _tool === "manage_milestone") && currentProject) {
-        api(`/api/projects/${currentProject.id}`).then((p) => {
-          if (p && currentProject) {
-            currentProject.chapters = p.chapters || [];
-            currentProject.elements = p.elements || [];
-            currentProject.meta = p.meta || currentProject.meta;
-            renderTree();
-          }
-        }).catch(() => {});
+      if (currentProject && MUTATING_TOOLS.test(_tool)) {
+        scheduleProjectRefresh();
       }
       scrollChat();
       break;
@@ -2743,8 +2950,15 @@ function handleEvent(evt, assistant) {
       break;
     }
     case "done": {
+      // 轮次结束: 兜底刷新一次项目数据 —— 防的是"白名单漏了某个工具/工具在子 agent 里跑完没走
+      // observation 分支"这类情况。有这层兜底, 就不需要用户手动刷新页面才能看到产出。
+      scheduleProjectRefresh();
       // 轮次结束: 主 agent 思考态切 "思考过程" (若还停在 "思考中")
       setMainThinkingState(assistant, false);
+      // 轮次结束兜底: 把本轮还敞着的思考面板全部自动收起
+      // (有的轮只有思考没正文, 不会触发正文打字机那条折叠路径)
+      autoCollapseThink(assistant);
+      if (assistant.subBubbles) for (const k of Object.keys(assistant.subBubbles)) autoCollapseThink(assistant.subBubbles[k]);
       removeThinkLoading();
       removeAllCarets();
       // 回放模式: 冲刷打字机残留 (回放时打字机不跑, 文本都在队列里)
@@ -3208,7 +3422,97 @@ window.addEventListener("resize", () => {
 });
 
 // ---------- composer ----------
-$("#send-btn").addEventListener("click", () => send());
+// 发送/停止二合一: 任务跑着且输入框为空 → 点了是停止; 其余 → 发送(会自动先停掉上一个任务)
+$("#send-btn").addEventListener("click", () => {
+  if (chatActive && !$("#input").value.trim()) { onStopBtnClick(); return; }
+  send();
+});
+// 输入框内容变化会改变按钮语义 (有字=发送, 空+任务跑着=停止), 必须联动刷新图标
+$("#input").addEventListener("input", updateComposerBtn);
+
+// ---------- 语音输入 (浏览器自带 Web Speech API, 不依赖后端) ----------
+// 直接调浏览器的语音识别: 点击开始 → 实时转写到输入框 (不发送) → 再点停止。
+// 注意: Chrome/Edge 支持 (webkitSpeechRecognition), 且必须是 localhost 或 https;
+// Firefox 不支持 → 按钮点击时提示, 不静默失败。
+const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
+let voiceRecog = null;      // SpeechRecognition 实例
+let voiceActive = false;    // 是否正在录音
+let voiceBaseText = "";     // 开始录音时输入框已有内容 (识别文本追加在它后面)
+
+function setVoiceUI(on) {
+  const btn = $("#voice-btn");
+  if (!btn) return;
+  btn.classList.toggle("recording", on);
+  btn.title = on ? "正在聆听… 点击停止" : "语音输入 (点击开始, 再点停止)";
+}
+
+function stopVoice(notify) {
+  voiceActive = false;
+  try { voiceRecog && voiceRecog.stop(); } catch {}
+  setVoiceUI(false);
+  if (notify) toast("语音输入已停止", "ok", 2000);
+}
+
+function startVoice() {
+  if (!SpeechRecognitionCtor) {
+    toast("当前浏览器不支持语音识别 (请用 Chrome / Edge, 且页面要开在 localhost 或 https)", "warn", 4000);
+    return;
+  }
+  if (voiceActive) { stopVoice(true); return; }
+  voiceRecog = new SpeechRecognitionCtor();
+  voiceRecog.lang = "zh-CN";
+  voiceRecog.continuous = true;       // 持续听, 用户手动停 (长指令不用来回点)
+  voiceRecog.interimResults = true;   // 边说边显示临时转写, 说完一句才定稿
+  voiceBaseText = $("#input").value;
+  let finalText = "";
+  voiceRecog.onresult = (e) => {
+    let interim = "";
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const r = e.results[i];
+      if (r.isFinal) finalText += r[0].transcript;
+      else interim += r[0].transcript;
+    }
+    // 整段重建 = 录音前的原文 + 已定稿 + 临时转写, 避免重复追加
+    const t = $("#input");
+    t.value = (voiceBaseText ? voiceBaseText : "") + finalText + interim;
+    autoGrow();
+    updateComposerBtn();
+  };
+  voiceRecog.onerror = (e) => {
+    // not-allowed = 用户拒绝了麦克风权限; audio-capture = 没麦克风
+    if (e.error === "not-allowed" || e.error === "service-not-allowed") {
+      toast("麦克风权限被拒绝, 请在浏览器地址栏允许麦克风", "warn", 4000);
+      stopVoice(false);
+    } else if (e.error === "audio-capture") {
+      toast("没检测到麦克风设备", "warn");
+      stopVoice(false);
+    }
+    // no-speech / network 等临时错误不打断, 让它继续听
+  };
+  voiceRecog.onend = () => {
+    // continuous=true 时浏览器也会在静音一段时间后自己结束 → 只要用户没点停, 就自动续听
+    if (voiceActive) {
+      try { voiceRecog.start(); } catch { stopVoice(false); }
+    } else {
+      setVoiceUI(false);
+    }
+  };
+  try {
+    voiceRecog.start();
+    voiceActive = true;
+    setVoiceUI(true);
+    toast("开始聆听, 说话即可 (说完再点一次麦克风停止)", "ok", 2500);
+  } catch (e) {
+    toast("语音识别启动失败: " + (e && e.message || e), "warn");
+  }
+}
+
+$("#voice-btn").addEventListener("click", (e) => {
+  e.stopPropagation();
+  startVoice();
+});
+// 页面离开时别留着麦克风占用
+window.addEventListener("beforeunload", () => { if (voiceActive) stopVoice(false); });
 $("#input").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
@@ -3803,6 +4107,10 @@ function renderSettings() {
   parts.push(`<div class="sp-sec"><div class="sp-sec-title">当前模型</div>`);
   parts.push(`<div class="sp-row"><label title="${esc(d.default)}">${esc(friendlyModelName(d.default))} <span class="muted" style="font-size:11px">(${esc(d.default)})</span></label>
     <span class="mc-badge ${d.ready ? "ok" : "warn"}">${d.ready ? "就绪" : "缺 Key"}</span></div>`);
+  // 「测试连接」: 后端 /api/config/test-connection 一直存在但前端从没接入,
+  // 用户换模型/换 Key 后只能"发一句话试试才知道通不通"。这里补上入口, 真发一次最小请求验证。
+  parts.push(`<div class="sp-row"><button class="btn sm" id="sp-test-conn">🔌 测试连接</button>
+    <span class="muted" id="sp-test-conn-result" style="font-size:11px"></span></div>`);
   parts.push(`</div>`);
 
   // ---- 已配置模型列表 ----
@@ -4059,6 +4367,39 @@ function bindSettings() {
         await loadSettings();
       } catch (e) {
         // api() 已 toast,兜底防止按钮卡死
+      }
+    };
+  }
+  // 「测试连接」: 真发一次最小请求 (maxTokens=1) 验证当前默认模型通不通。
+  // 换模型/换 Key/换 Base 之后不用"发句话试试才知道", 点一下就有明确结果 + 耗时。
+  const testConnBtn = $("#sp-test-conn");
+  if (testConnBtn) {
+    testConnBtn.onclick = async () => {
+      const out = $("#sp-test-conn-result");
+      testConnBtn.disabled = true;
+      const oldText = testConnBtn.textContent;
+      testConnBtn.textContent = "测试中…";
+      if (out) { out.textContent = ""; out.style.color = "var(--text-dim)"; }
+      const t0 = Date.now();
+      try {
+        const r = await api("/api/config/test-connection", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+        });
+        const ms = Date.now() - t0;
+        if (out) {
+          out.textContent = `${r && r.ok ? "✅" : "❌"} ${esc((r && r.message) || "无返回")} (${(ms / 1000).toFixed(1)}s)`;
+          out.style.color = r && r.ok ? "var(--green)" : "var(--red)";
+        }
+      } catch (e) {
+        if (out) {
+          out.textContent = `❌ 请求失败: ${esc(String(e && e.message || e))}`;
+          out.style.color = "var(--red)";
+        }
+      } finally {
+        testConnBtn.disabled = false;
+        testConnBtn.textContent = oldText;
       }
     };
   }

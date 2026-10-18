@@ -32,16 +32,20 @@ let backend: BrowserBackend = "fetch-only";
 let server: http.Server | null = null;
 let alreadyStarted = false;
 let scraplingOk: boolean | undefined;
+// 侧车实际来源 (决定对外报告的 backend): scrapling=curl_cffi 已装 / fetch-fallback=只有 python, 包没装
+let scraplingSource: "scrapling" | "fetch-fallback" | "none" = "none";
 
 /** 探测 Scrapling 侧车是否可用 (python3 + scrapling 包). */
 async function probeScrapling(): Promise<boolean> {
   if (scraplingOk !== undefined) return scraplingOk;
   const r = await callScrapling("fetch", { url: "https://example.com", maxChars: 200 }, 20000).catch(() => null);
   scraplingOk = !!(r && r.ok && (r.source === "scrapling" || r.source === "fetch-fallback"));
-  if (scraplingOk && r?.source === "fetch-fallback") {
-    console.log("[browser-service] Python 可用但 scrapling 包未装 (fetch 层兜底, 建议: pip install -r scrapling/requirements.txt)");
-  } else if (scraplingOk) {
+  scraplingSource = scraplingOk ? (r!.source as "scrapling" | "fetch-fallback") : "none";
+  if (scraplingOk && scraplingSource === "scrapling") {
+    backend = "scrapling";
     console.log("[browser-service] Scrapling 侧车可用 (curl_cffi 指纹抓取)");
+  } else if (scraplingOk) {
+    console.log("[browser-service] Python 可用但 scrapling 包未装 (fetch 层兜底, 建议: pip install -r scrapling/requirements.txt)");
   } else {
     console.log("[browser-service] Scrapling 侧车不可用 (无 python3), backend=dom-sim/fetch-only");
   }
@@ -212,8 +216,14 @@ export async function startBrowserService(): Promise<{ port: number; backend: Br
     }
   }
 
-  // 预热 Scrapling 探测 (不阻塞服务启动; 失败不影响降级链路)
-  probeScrapling().catch(() => {});
+  // 预热 Scrapling 探测: 等一小会儿 (上限 12s) 拿到真实 backend 再返回,
+  // 避免启动日志/health 接口恒显示 fetch-only —— 用户会误以为"爬虫压根没启用"。
+  // 超时不阻塞服务启动: probeScrapling 结果已缓存, 后续请求会再次触发并更正 backend。
+  await Promise.race([
+    probeScrapling().catch(() => false),
+    new Promise<boolean>((r) => setTimeout(() => r(false), 12_000)),
+  ]);
+  if (scraplingSource === "scrapling") backend = "scrapling";
 
   server = http.createServer(async (req, res) => {
     const p = req.url?.split("?")[0];

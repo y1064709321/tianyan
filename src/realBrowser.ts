@@ -15,6 +15,7 @@
  * 判据必须看**有没有抽出真实内容**。
  */
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
+import { logInfo } from "./logger.js";
 
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -121,18 +122,52 @@ function getContext(): Promise<BrowserContext> {
   return ctxPromise;
 }
 
+/**
+ * 启动浏览器: 优先用 Playwright 自带的 Chromium;
+ * 没下 Chromium (或下载不完整) 时自动回退到系统已装的 Chrome / Edge,
+ * 这样用户不必为 100MB+ 的 Chromium 下载等待。
+ * 回退顺序: bundled Chromium → chrome → msedge → chrome-beta
+ */
+async function launchBrowser(): Promise<Browser> {
+  const args = [
+    "--disable-blink-features=AutomationControlled",
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--lang=zh-CN",
+  ];
+
+  try {
+    return await chromium.launch({ headless: true, args });
+  } catch (e) {
+    const msg = String((e as Error)?.message || e);
+    // 只有"没装浏览器"这类错误才值得回退; 其他错误 (端口/权限) 直接抛, 别掩盖真问题
+    if (!/Executable doesn't exist|is not found at|browserType\.launch|install/i.test(msg)) {
+      throw e;
+    }
+    logInfo(`[browser] bundled Chromium 不可用 (${msg.slice(0, 80)}), 尝试系统浏览器...`);
+  }
+
+  // 系统浏览器回退: Playwright 的 channel 会去注册表/默认路径找已安装的浏览器
+  for (const channel of ["chrome", "msedge", "chrome-beta"] as const) {
+    try {
+      const b = await chromium.launch({ headless: true, args, channel });
+      logInfo(`[browser] 已回退到系统浏览器: ${channel}`);
+      return b;
+    } catch {
+      // 该 channel 没装, 试下一个
+    }
+  }
+
+  throw new Error(
+    "没有可用的浏览器: Playwright 自带 Chromium 未安装, 系统也没找到 Chrome/Edge。" +
+    "运行 `npm exec -- playwright install chromium` 安装, 或安装 Chrome 后重试。",
+  );
+}
+
 async function createContext(): Promise<BrowserContext> {
   let browser: Browser;
   try {
-    browser = await chromium.launch({
-      headless: true,
-      args: [
-        "--disable-blink-features=AutomationControlled",
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--lang=zh-CN",
-      ],
-    });
+    browser = await launchBrowser();
   } catch (e) {
     // 环境级故障 (没装 Chromium / 端口被拦 / 沙箱限制) → 只有这里才累计熔断,
     // 避免某站超时这类站点级问题把整层拖死。

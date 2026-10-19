@@ -15,6 +15,14 @@ chunk_size: 2000
 chunk_overlap: 200
 retrieve_k: 6
 
+# 上下文预算 (滚动摘要压缩)
+#   窗口 128k -> 用量超过 128000*0.75 (约 96k) 触发压缩
+#   压缩后保留最近 35% 原文, 更早的对话压成摘要落库 (只压增量, 不重复压)
+#   小模型请按实际窗口调小, 例如 32k 窗口填 32000
+context_window: 128000
+context_compact_ratio: 0.75
+context_keep_ratio: 0.35
+
 # 默认模型 (agent 实际使用的模型, litellm 前缀格式)
 # 2026-10-17: 默认为 DeepSeek。deepseek-flash 为官方现行规范 ID (DeepSeek-V4.1-Flash)。
 # 注意: 需在下方 api_key 填入 DeepSeek 密钥, 或设置环境变量 DEEPSEEK_API_KEY / TIANYAN_API_KEY;

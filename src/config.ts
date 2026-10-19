@@ -55,6 +55,10 @@ const DEFAULT_SETTINGS: Settings = {
   // 默认 autonomous: 主 Agent 拥有规划决策权(感知→规划→执行), 铁律框架(7步顺序/工具白名单/质量门禁)保持不变
   workflowMode: "autonomous" as const,
   agents: {},
+  // 上下文预算: 128k 窗口, 到 75% (96k) 触发自动压缩, 压缩后保留最近 35% (约 45k)
+  contextWindow: 128_000,
+  contextCompactRatio: 0.75,
+  contextKeepRatio: 0.35,
 };
 
 let _settings: Settings | null = null;
@@ -173,6 +177,9 @@ export function loadSettings(configPath?: string): Settings {
     proxy,
     agents,
     workflowMode: (raw.workflow_mode as "state_machine" | "crewai" | "autonomous") || DEFAULT_SETTINGS.workflowMode,
+    contextWindow: Number(raw.context_window) || DEFAULT_SETTINGS.contextWindow,
+    contextCompactRatio: Number(raw.context_compact_ratio) || DEFAULT_SETTINGS.contextCompactRatio,
+    contextKeepRatio: Number(raw.context_keep_ratio) || DEFAULT_SETTINGS.contextKeepRatio,
   };
 
   _settings = s;
@@ -229,6 +236,9 @@ export function saveSettings(): void {
     chunk_overlap: s.chunkOverlap,
     retrieve_k: s.retrieveK,
     workflow_mode: s.workflowMode,
+    context_window: s.contextWindow,
+    context_compact_ratio: s.contextCompactRatio,
+    context_keep_ratio: s.contextKeepRatio,
   });
   if (s.proxy) doc.proxy = s.proxy;
   if (Object.keys(s.agents).length > 0) {
@@ -569,10 +579,13 @@ export function updateAgentConfig(
 
 // 更新全局 Agent/工作流参数
 export function updateGlobalSettings(
-  opts: { maxSteps?: number; chunkSize?: number; retrieveK?: number; runMaxTokens?: number; runMaxCost?: number; runMaxDuration?: number; loopDetectCount?: number },
+  opts: { maxSteps?: number; chunkSize?: number; retrieveK?: number; runMaxTokens?: number; runMaxCost?: number; runMaxDuration?: number; loopDetectCount?: number; contextWindow?: number; contextCompactRatio?: number; contextKeepRatio?: number },
 ): void {
   const s = getSettings();
   if (opts.maxSteps !== undefined) s.maxSteps = opts.maxSteps;
+  if (opts.contextWindow !== undefined) s.contextWindow = opts.contextWindow;
+  if (opts.contextCompactRatio !== undefined) s.contextCompactRatio = opts.contextCompactRatio;
+  if (opts.contextKeepRatio !== undefined) s.contextKeepRatio = opts.contextKeepRatio;
   if (opts.chunkSize !== undefined) s.chunkSize = opts.chunkSize;
   if (opts.retrieveK !== undefined) s.retrieveK = opts.retrieveK;
   if (opts.runMaxTokens !== undefined) s.runMaxTokens = opts.runMaxTokens;

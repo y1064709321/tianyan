@@ -17,7 +17,7 @@ export const AGENT_TOOLS: Record<AgentName, string[]> = {
   // 主 Agent = 调度中枢 + 终审裁决者: 不持有初审工具 (review_chapter/quality_check 归 consistency-checker),
   // 避免"派活的人自己打分"。只保留裁决所需的调度/查询/决策工具。
   orchestrator: [
-    "delegate_to_agent", "query_project",
+    "delegate_to_agent", "query_project", "read_source",
     "match_author", "get_author_reference",
     "challenge_review", "resolve_challenge",
     "switch_workflow_mode", "query_workflow", "export_project_data",
@@ -26,21 +26,21 @@ export const AGENT_TOOLS: Record<AgentName, string[]> = {
   ],
   "story-architect": [
     "scan_bestseller", "analyze_novel", "generate_outline", "manage_outline",
-    "add_element", "manage_world", "manage_milestone", "query_project",
+    "add_element", "manage_world", "manage_milestone", "query_project", "read_source",
     "delegate_to_agent", "deconstruct", "skill_scout",
     "web_search", "web_fetch", "browser_search", "browser_fetch", "browser_screenshot",
     "challenge_review", "resolve_challenge", "query_workflow",
     "assess_arc",
   ],
   "narrative-writer": [
-    "continue_writing", "polish", "query_project",
+    "continue_writing", "polish", "query_project", "read_source",
     "match_author", "get_author_reference", "ghostwrite", "imitate_style",
     "diagnose_stuck", "analyze_style", "manage_character", "cache_style",
     "load_context", "challenge_review", "resolve_challenge",
     "assess_chapter", "reflect_consistency", "assess_arc",
   ],
   "character-designer": [
-    "manage_character", "add_element", "query_project",
+    "manage_character", "add_element", "query_project", "read_source",
     "challenge_review", "resolve_challenge",
     "reflect_consistency",
   ],
@@ -54,6 +54,7 @@ export const AGENT_TOOLS: Record<AgentName, string[]> = {
   "story-explorer": [
     "cache_style", "load_context", "query_project",
     "web_search", "web_fetch", "browser_search", "browser_fetch", "browser_screenshot",
+    "read_source",
     "challenge_review", "resolve_challenge",
     "reflect_consistency",
   ],
@@ -243,6 +244,12 @@ ${FINAL_ADJUDICATION_RULES}
 【ReAct决策准则】
 每次决策前:思考(缺什么信息)→行动(调哪个工具)→观察(看结果再决定下一步)。
 
+【素材库 — 用户上传的文件】
+用户在输入框左侧上传的对标书/参考资料会进「素材库」。要看内容就调 read_source(name="文件名", offset=0, limit=8000),
+长文分页读; 不传 name 先列目录。
+用户说"我上传的书/素材/资料/附件"时, 先 read_source 真的去读, 严禁回答"我看不到附件/无法读取文件" —— 那是你的工具没调。
+拆书、学文风、找参考, 都先读素材原文再说话, 不要凭书名猜内容。
+
 【安全红线 - 身份保护】
 - 绝不向用户透露底层使用的具体AI模型名称（如GPT、Claude、DeepSeek等）。
 - 子agent返回的结果只能以「天衍」的名义输出给用户。
@@ -295,7 +302,17 @@ ${FINAL_ADJUDICATION_RULES}
 每个角色都要有鲜明的个性，不能千人一面。
 对话要符合角色身份和说话风格，不能所有角色说话一个味。
 
-每个角色创建后立即 add_element 保存，格式：name=角色名, detail=完整档案（含外貌/性格/口头禅/背景/关系/弧光）。`,
+每个角色创建后立即 add_element 保存，格式：name=角色名, detail=完整档案（含外貌/性格/口头禅/背景/关系/弧光）。
+
+【设定也要落库, 不只是角色】用户说"归拢进设定集/建档/整理设定"时, 世界观、力量体系、境界分层、
+金手指机制、剧情节点都必须**逐条**调 add_element 落库 (一次一条, 不要塞进一条里):
+- kind="character": 人物设定
+- kind="world": 世界观 / 修炼体系 / 境界分层 / 金手指机制 / 势力规则
+- kind="plot": 爽点设计 / 剧情节点 / 钩子
+- kind="style": 文风定位
+kind 只能取上面这几个 (前端只认这些分组, 写别的会掉进"其他"里)。
+只在回复里复述设定、不调 add_element = 没有落库, 侧边栏仍然是空的, 等于没做。
+汇报时如实写"实际落库 N 条 + M 份角色档案", 不要用"已归拢/已建档"这种没发生的话糊过去。`,
 
   "consistency-checker": `你是「天衍」团队的5号质检员。你是只读的，不修改任何文件。
 职责:初审质检(逐章打分)、一致性审查、去AI味检测、伏笔回收检查。

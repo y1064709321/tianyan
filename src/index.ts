@@ -5,20 +5,24 @@ import { corsMiddleware, authMiddleware } from "./security/auth.js";
 import { loadSettings, getSettings, updateModelConfig, removeModelConfig, updateAgentConfig, updateGlobalSettings, getAgentConfigs, PROVIDER_PRESETS } from "./config.js";
 import { initLogger, logInfo, logWarn, logError, capLooseLogs } from "./logger.js";
 import * as store from "./store.js";
-import { initDb, createProject, getProject, listProjects, deleteProject, stats } from "./store.js";
+import { initDb, createProject, getProject, listProjectSummaries, deleteProject, stats } from "./store.js";
 import * as memory from "./memory/index.js";
+import { ensureSandbox, purgeSandbox, sandboxSize, sandboxPaths, purgeOrphanSandboxes } from "./sandbox.js";
+import * as styleLib from "./styleLibrary.js";
 import { executeCode } from "./security/sandbox.js";
 import { chat, testConnection, friendlyError } from "./llm.js";
 import { runAgentLoop } from "./agents/runner.js";
 import { detectIntent, executeWorkflow, getProjectProgress } from "./perception/engine.js";
 import { plan as plannerPlan } from "./planner.js";
 import { setArcTarget } from "./arc.js";
+import { compactConversation, type CompactInfo } from "./context/compact.js";
 import type { Phase } from "./workflow.js";
 import { BUILTIN_SKILLS, isBuiltinEnabled, setBuiltinEnabled, listCustomSkills, addCustomSkill, removeCustomSkill, setCustomSkillEnabled, getAgentSkillPrompts } from "./skills.js";
 import { getMeta, isValid, isReadonly, AGENT_TOOLS, getMaxDelegateDepth, DEFAULT_AGENT, AGENT_META, getAgentPrompt, WORKFLOW_PHASES } from "./agents/index.js";
 import type { SSEEvent, AgentName } from "./types.js";
 import { cancelRun, clearRunCancel } from "./runCancel.js";
 import { existsSync, readFileSync } from "node:fs";
+import { inflateRawSync } from "node:zlib";
 import { join, dirname } from "node:path";
 import { randomBytes } from "node:crypto";
 
@@ -100,6 +104,9 @@ app.get("/api/settings", (c) => {
     chunkOverlap: s.chunkOverlap, chunk_overlap: s.chunkOverlap,
     retrieveK: s.retrieveK, retrieve_k: s.retrieveK,
     proxy: s.proxy, serverPort: s.serverPort,
+    contextWindow: s.contextWindow, context_window: s.contextWindow,
+    contextCompactRatio: s.contextCompactRatio, context_compact_ratio: s.contextCompactRatio,
+    contextKeepRatio: s.contextKeepRatio, context_keep_ratio: s.contextKeepRatio,
     agents: getAgentConfigs(),
   });
 });
@@ -170,6 +177,9 @@ app.put("/api/settings/agent", async (c) => {
       runMaxCost: body.run_max_cost !== undefined ? Number(body.run_max_cost) : undefined,
       runMaxDuration: body.run_max_duration !== undefined ? Number(body.run_max_duration) : undefined,
       loopDetectCount: body.loop_detect_count !== undefined ? Number(body.loop_detect_count) : undefined,
+      contextWindow: body.context_window !== undefined ? Number(body.context_window) : undefined,
+      contextCompactRatio: body.context_compact_ratio !== undefined ? Number(body.context_compact_ratio) : undefined,
+      contextKeepRatio: body.context_keep_ratio !== undefined ? Number(body.context_keep_ratio) : undefined,
     });
     // 每个 Agent 的参数
     const agentBodies = body.agents;
@@ -216,6 +226,8 @@ app.put("/api/settings/tier-model", async (c) => {
 app.post("/api/projects", async (c) => {
   const body = await c.req.json<{ name: string; genre?: string; premise?: string; style?: string; audience?: string; chapters?: string[] }>();
   const id = createProject(body.name, body.genre, body.premise, body.style, body.audience);
+  // 立即建沙箱目录: 后续导出/抓取缓存/临时产物都落在这里, 与其他书互不干扰
+  ensureSandbox(id);
   // 批量创建章节 (如果提供了章节列表)
   const chapters = body.chapters || [];
   const createdChapters = chapters.map((title, idx) => {
@@ -224,7 +236,7 @@ app.post("/api/projects", async (c) => {
   });
   return c.json({ id, ...body, chapters: createdChapters });
 });
-app.get("/api/projects", (c) => c.json(listProjects()));
+app.get("/api/projects", (c) => c.json(listProjectSummaries()));
 app.get("/api/projects/:pid", (c) => {
   const p = getProject(c.req.param("pid"));
   if (!p) return c.json({ error: "not found" }, 404);
@@ -232,12 +244,34 @@ app.get("/api/projects/:pid", (c) => {
     ...p,
     chapters: store.listChapters(p.id),
     elements: store.listElements(p.id),
+    sources: store.listSources(p.id),   // 素材库: 前端文件树直接读这个字段
     stats: stats(p.id),
   });
 });
+// 编辑项目: 名称/题材/文风/核心设定/频道 (只传要改的字段, 没传的原样保留)
+app.put("/api/projects/:pid", async (c) => {
+  const pid = c.req.param("pid");
+  if (!getProject(pid)) return c.json({ error: "not found" }, 404);
+  const body = await c.req.json<{
+    name?: string; genre?: string; style?: string; premise?: string; audience?: string;
+  }>();
+  const name = typeof body.name === "string" ? body.name.trim() : undefined;
+  if (name !== undefined && !name) return c.json({ error: "项目名称不能为空" }, 400);
+  store.updateProject(pid, {
+    name,
+    genre: body.genre,
+    style: body.style,
+    premise: body.premise,
+    audience: body.audience,
+  });
+  return c.json({ ok: true, project: getProject(pid) });
+});
 app.delete("/api/projects/:pid", (c) => {
-  deleteProject(c.req.param("pid"));
-  return c.json({ ok: true });
+  const pid = c.req.param("pid");
+  deleteProject(pid);
+  // 删库之后同步清掉沙箱目录, 否则导出文件/抓取缓存会变成孤儿占着磁盘
+  const purged = purgeSandbox(pid);
+  return c.json({ ok: true, sandboxPurged: purged });
 });
 
 // ===== 章节管理 =====
@@ -327,7 +361,9 @@ app.get("/api/projects/:pid/metrics", (c) => {
 });
 
 // ===== Sources / 搜索 =====
-app.get("/api/projects/:pid/sources", (c) => c.json(store.listChunks(c.req.param("pid"))));
+// 素材库索引 (按文件名聚合) —— 前端 selectProject 直接拿它渲染左侧素材库。
+// 旧实现返回的是原始 chunks 行 (一条 chunk 一个条目), 文件树会显示成 N 个同名文件 + "undefined块"。
+app.get("/api/projects/:pid/sources", (c) => c.json(store.listSources(c.req.param("pid"))));
 app.get("/api/projects/:pid/search", (c) => {
   const q = c.req.query("q") || "";
   if (!q) return c.json([]);
@@ -335,28 +371,142 @@ app.get("/api/projects/:pid/search", (c) => {
 });
 
 // ===== Upload =====
+// 素材导入: 文件 → 纯文本 → 分块落库 (chunks 表)。
+// 历史上的三个坑 (用户反馈"上传了但模型读不到"):
+//   ① 前端 append("file"), 后端 getAll("files") → 永远拿到空数组, 静默什么都没存;
+//   ② 直接用 file.text() 读 docx/pdf → 拿到的是二进制垃圾, 存进去也是乱码;
+//   ③ 存了 chunks 但从来没注入过任何提示词, 模型自然"看不见"。
+// 现在: 字段名两种都收, 按扩展名抽文本, 同名重传先清旧块, 并把素材索引注入上下文 (见 buildChatMessages)。
+
+/** 极简 ZIP 读取: 只为了从 .docx 里取出 word/document.xml (不引第三方依赖) */
+function readZipEntry(buf: Buffer, wantName: string): Buffer | null {
+  // EOCD 在文件尾部, 签名 0x06054b50
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= Math.max(0, buf.length - 66000); i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) return null;
+  const entries = buf.readUInt16LE(eocd + 10);
+  let off = buf.readUInt32LE(eocd + 16);
+  for (let i = 0; i < entries; i++) {
+    if (off + 46 > buf.length || buf.readUInt32LE(off) !== 0x02014b50) return null;
+    const method = buf.readUInt16LE(off + 10);
+    const compSize = buf.readUInt32LE(off + 20);
+    const nameLen = buf.readUInt16LE(off + 28);
+    const extraLen = buf.readUInt16LE(off + 30);
+    const commentLen = buf.readUInt16LE(off + 32);
+    const localOff = buf.readUInt32LE(off + 42);
+    const name = buf.toString("utf8", off + 46, off + 46 + nameLen);
+    if (name === wantName) {
+      if (buf.readUInt32LE(localOff) !== 0x04034b50) return null;
+      const lNameLen = buf.readUInt16LE(localOff + 26);
+      const lExtraLen = buf.readUInt16LE(localOff + 28);
+      const start = localOff + 30 + lNameLen + lExtraLen;
+      const data = buf.subarray(start, start + compSize);
+      if (method === 0) return Buffer.from(data);
+      if (method === 8) { try { return inflateRawSync(data); } catch { return null; } }
+      return null;
+    }
+    off += 46 + nameLen + extraLen + commentLen;
+  }
+  return null;
+}
+
+/** .docx → 纯文本 (去 XML 标签, 段落转换行) */
+function extractDocx(buf: Buffer): string {
+  const xml = readZipEntry(buf, "word/document.xml");
+  if (!xml) return "";
+  return xml.toString("utf8")
+    .replace(/<w:tab[^>]*\/>/g, "\t")
+    .replace(/<\/w:p>/g, "\n")
+    .replace(/<w:br[^>]*\/>/g, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/** 按扩展名抽文本; 抽不出来返回 { error } 让前端说人话 */
+async function extractText(file: File): Promise<{ text: string; error?: string }> {
+  const name = (file.name || "").toLowerCase();
+  const ext = name.includes(".") ? name.slice(name.lastIndexOf(".")) : "";
+  if (ext === ".docx") {
+    const buf = Buffer.from(await file.arrayBuffer());
+    const text = extractDocx(buf);
+    return text ? { text } : { text: "", error: "docx 解析失败 (可能不是标准 Word 文档或文件已损坏), 可另存为 txt 再传" };
+  }
+  if (ext === ".pdf" || ext === ".epub") {
+    return { text: "", error: `${ext.slice(1).toUpperCase()} 暂不支持直接解析 (需要额外解析库)。请用 Word 另存为 .docx 或 .txt 再上传` };
+  }
+  if (ext === ".doc") {
+    return { text: "", error: "老版 .doc 不支持, 请用 Word 另存为 .docx 再上传" };
+  }
+  // 其余按纯文本读; 二进制文件 (含大量 NUL) 直接拒绝, 避免把乱码存进素材库
+  const text = await file.text();
+  if (text.includes("\u0000")) {
+    return { text: "", error: "这个文件看起来是二进制格式 (不是纯文本), 请转成 txt/md/docx 再上传" };
+  }
+  return { text };
+}
+
 app.post("/api/projects/:pid/upload", async (c) => {
   const pid = c.req.param("pid");
   try {
     const formData = await c.req.formData();
-    const files = formData.getAll("files") as File[];
-    const results: Array<{ name: string; chunks: number; size: number }> = [];
+    // 前端历史版本用 "file" (单数), 接口约定是 "files" (复数) —— 两个都收, 谁也别猜
+    const files = [
+      ...(formData.getAll("files") as File[]),
+      ...(formData.getAll("file") as File[]),
+    ].filter((f) => f && typeof f !== "string" && (f as File).size >= 0);
+    if (!files.length) return c.json({ error: "没有收到文件 (form 字段应为 files 或 file)" }, 400);
+
+    const results: Array<{ source: string; chunks: number; chars: number }> = [];
+    const errors: Array<{ name: string; error: string }> = [];
     for (const file of files) {
-      const text = await file.text();
+      const { text, error } = await extractText(file);
+      if (error) { errors.push({ name: file.name, error }); continue; }
+      if (!text.trim()) { errors.push({ name: file.name, error: "文件内容为空 (抽出来 0 个字)" }); continue; }
+      // 同名重传 = 覆盖, 不是叠加
+      store.deleteSource(pid, file.name);
       const chunkSize = s.chunkSize;
       const chunks: string[] = [];
-      for (let i = 0; i < text.length; i += chunkSize) {
-        chunks.push(text.slice(i, i + chunkSize));
-      }
-      for (let i = 0; i < chunks.length; i++) {
-        store.addChunk(pid, file.name, i, chunks[i]!);
-      }
-      results.push({ name: file.name, chunks: chunks.length, size: file.size });
+      for (let i = 0; i < text.length; i += chunkSize) chunks.push(text.slice(i, i + chunkSize));
+      for (let i = 0; i < chunks.length; i++) store.addChunk(pid, file.name, i, chunks[i]!);
+      results.push({ source: file.name, chunks: chunks.length, chars: text.length });
+      logInfo(`[素材] 导入 ${file.name}: ${text.length} 字 / ${chunks.length} 块`);
     }
-    return c.json({ ok: true, files: results });
+    // 兼容老前端字段 (source/chunks/chars 取第一个文件), 同时给新的 files 数组
+    const first = results[0];
+    return c.json({
+      ok: results.length > 0,
+      source: first?.source,
+      chunks: first?.chunks,
+      chars: first?.chars,
+      files: results,
+      errors,
+      error: results.length ? undefined : (errors[0]?.error || "导入失败"),
+    });
   } catch (e) {
     return c.json({ error: (e as Error).message }, 400);
   }
+});
+
+// 素材全文 (前端预览抽屉用) —— 以前预览走 /search 且字段对不上, 打开永远是"(无内容)"
+app.get("/api/projects/:pid/sources/:name", (c) => {
+  const pid = c.req.param("pid");
+  const name = decodeURIComponent(c.req.param("name"));
+  const text = store.getSourceText(pid, name);
+  if (!text) return c.json({ error: "素材不存在" }, 404);
+  return c.json({ source: name, chars: text.length, text });
+});
+
+app.delete("/api/projects/:pid/sources/:name", (c) => {
+  const pid = c.req.param("pid");
+  const name = decodeURIComponent(c.req.param("name"));
+  const n = store.deleteSource(pid, name);
+  return c.json({ ok: true, deleted: n });
 });
 
 // ===== Export =====
@@ -396,6 +546,60 @@ app.get("/api/projects/:pid/memory", (c) => {
 app.get("/api/projects/:pid/memory/search", (c) => {
   const q = c.req.query("q") || "";
   return c.json(memory.searchLongTermMemories(c.req.param("pid"), q));
+});
+
+// ===== 共享文笔样本库 (跨项目共用, 不按 pid 隔离) =====
+// 列表 / 统计 / 录入 / 删除 / 预览召回结果。
+// 召回结果与写作时注入的是同一函数, 所见即模型所得。
+app.get("/api/style/samples", (c) => {
+  const limit = Number(c.req.query("limit") || "50");
+  return c.json({ samples: styleLib.listStyleSamples(limit), stats: styleLib.styleStats() });
+});
+app.post("/api/style/samples", async (c) => {
+  const body = await c.req.json<{ text: string; kind?: string; genre?: string; source?: string; rating?: number }>();
+  if (!body?.text) return c.json({ error: "缺少 text" }, 400);
+  const VALID_KINDS = ["opening", "dialogue", "action", "description", "ending", "other"] as const;
+  type Kind = (typeof VALID_KINDS)[number];
+  const kind = VALID_KINDS.includes(body.kind as Kind) ? (body.kind as Kind) : undefined;
+  const id = styleLib.addStyleSample({
+    text: body.text,
+    kind,
+    genre: body.genre,
+    source: body.source,
+    rating: body.rating,
+  });
+  if (!id) return c.json({ error: "片段太短(需≥20字)或太长(≤4000字)" }, 400);
+  return c.json({ ok: true, id });
+});
+app.delete("/api/style/samples/:sid", (c) => {
+  return c.json({ ok: styleLib.deleteStyleSample(c.req.param("sid")) });
+});
+app.get("/api/style/preview", (c) => {
+  // 预览: 写作时实际会注入哪些样本 (用于调参与确认题材匹配是否正确)
+  const genre = c.req.query("genre") || "";
+  return c.json({
+    genre,
+    samples: styleLib.readStyleSamples({ genre, limit: 5, perSampleChars: 400, totalChars: 2000 }),
+    stats: styleLib.styleStats(),
+  });
+});
+
+// ===== 项目沙箱管理 =====
+app.get("/api/projects/:pid/sandbox", (c) => {
+  const pid = c.req.param("pid");
+  return c.json({ path: sandboxPaths(pid), sizeBytes: sandboxSize(pid) });
+});
+// 手动清理沙箱 (保留项目与数据库记录, 只清文件)
+app.delete("/api/projects/:pid/sandbox", (c) => {
+  const pid = c.req.param("pid");
+  const ok = purgeSandbox(pid);
+  ensureSandbox(pid); // 清完立刻重建空目录, 避免下一次写入找不到路径
+  return c.json({ ok, sizeAfter: sandboxSize(pid) });
+});
+// 回收所有孤立沙箱 (项目已删但目录还在)
+app.post("/api/sandbox/gc", (c) => {
+  const alive = listProjectSummaries().map((p) => p.id);
+  return c.json({ removed: purgeOrphanSandboxes(alive) });
 });
 
 // ===== 计划/审批/检查点 (占位) =====
@@ -647,7 +851,7 @@ async function runFastPathExpert(
 }
 
 // 共享 SSE 执行函数 (chat 和 run 共用)
-function buildSseStream(pid: string, userInput: string, agentName: AgentName, sessionId?: string) {
+function buildSseStream(pid: string, userInput: string, agentName: AgentName, sessionId?: string, chapterCount = 1) {
   const sid = sessionId || randomBytes(6).toString("hex");
   const proj = getProject(pid);
   const encoder = new TextEncoder();
@@ -688,6 +892,8 @@ function buildSseStream(pid: string, userInput: string, agentName: AgentName, se
 
           const projData = parseProjectInput(userInput);
           const newPid = store.createProject(projData.name, projData.genre, projData.premise, projData.style, projData.audience);
+          // 通知前端: 项目列表变了 (旧版聊天里建项目后前端毫不知情, 列表还是老的, 用户以为"没建成/覆盖了")
+          send({ type: "project_created", agent: agentName, id: newPid, name: projData.name });
           const summary = `✅ 已创建项目「${projData.name}」\n类型: ${projData.genre} | 设定: ${projData.premise}\n\n项目ID: ${newPid}\n\n📋 项目已创建，正在启动 Phase 1: 扫榜调研...`;
           send({ type: "planner_decision", agent: agentName, intent: "create_project", route: "create_project → Phase 1", reason: "检测到新项目创建意图", steps: ["parseProjectInput", "createProject", "setArcTarget", "Phase 1"] });
           send({ type: "answer_start", agent: agentName });
@@ -752,15 +958,27 @@ function buildSseStream(pid: string, userInput: string, agentName: AgentName, se
               let expertUsed = scanDec.agent as AgentName;
               let scanDeliverable = r1.content;
               // 终审打回 → 再补救一次 (旧逻辑直接把被打回的内容当成果发 done, 长任务停在第 1 步)。
-              // 备选走 story-explorer + web_search: 它是只读 agent 拿不到 scan_bestseller,
-              // 但联网检索能补出行业报告/榜单文章, 总比交不出东西强。
+              //
+              // 【降级顺序踩过坑】旧逻辑降级到 story-explorer + web_search, 那是死路:
+              //   · story-explorer 是只读 agent, 调 scan_bestseller 会被 permissions 硬拒 →
+              //     它永远拿不到真榜单, 只能复述用户原话
+              //   · web_search 拿 "${题材}小说排行榜 热门 题材 趋势" 去 Bing 搜, 实测返回空
+              //     (截图实例: 两次都「未抓到搜索结果」→ 终审判"产出实质为空" → 用户看到任务跑了等于没跑)
+              // 扫榜的语义就是抓榜单, scan_bestseller 是唯一有稳定数据源的工具 (2026-10-18 刚修好,
+              // 25/25 逐字 100%)。所以降级必须**继续用 scan_bestseller**, 换 story-architect (有写入权限)
+              // + 换一个数据源 (巅峰榜) 才叫补救, 而不是把工具换成搜不到榜单的搜索引擎。
+              // web_search 只留作 scan_bestseller 真挂了(站点改版)时的最后手段。
               if (!r1.approved) {
-                const alt = "story-explorer" as AgentName;
-                const scanFallbackQuery = `${scanGenre}小说排行榜 热门 题材 趋势`;
-                logInfo(`[意图前置] 扫榜交付被终审打回, 换 ${alt} (web_search 降级) 再跑一次`);
+                const alt = "story-architect" as AgentName;
+                logInfo(`[意图前置] 扫榜交付被终审打回, 换数据源(巅峰榜)+ ${alt} 再跑一次`);
                 send({ type: "delegate", from: "orchestrator", to: alt, task: scanTask, depth: 1 });
                 send({ type: "sub_agent_start", agent: alt, task: scanTask, depth: 1 });
-                const r2 = await runFastPathExpert(pid, runId, alt, scanTask, userInput, "web_search", { query: scanFallbackQuery, max_results: 10 }, "扫榜(降级检索)", send);
+                const r2 = await runFastPathExpert(
+                  pid, runId, alt, scanTask, userInput,
+                  "scan_bestseller",
+                  { genre: scanGenre, board: "巅峰榜", platform: "番茄小说" },
+                  "扫榜(换数据源重试)", send,
+                );
                 if (r2.approved || r2.content.length > scanDeliverable.length) { scanDeliverable = r2.content; expertUsed = alt; }
               }
               const subDur = Date.now() - t0p;
@@ -815,7 +1033,12 @@ function buildSseStream(pid: string, userInput: string, agentName: AgentName, se
 
             // 把规划上下文注入 orchestrator 的系统消息(节拍器 + 路线图), 让主 Agent 自主执行
             const plannerCtx = p.contextBlock;
-            const messages = buildChatMessages(pid, sid, agentName, userInput);
+            const built = await buildChatMessages(pid, sid, agentName, userInput);
+            const messages = built.messages;
+            if (built.compact.compacted) {
+              send({ type: "observation", agent: agentName, tool: "context_compacted",
+                result: `上下文已自动压缩: ${built.compact.beforeTokens} → ${built.compact.afterTokens} tokens (窗口 ${Math.round(built.compact.window / 1000)}k, 早期 ${built.compact.dropped} 条压成摘要, 保留最近 ${built.compact.kept} 条)` });
+            }
             messages.push({ role: "system", content: plannerCtx });
 
             await runAgentLoop({
@@ -837,6 +1060,7 @@ function buildSseStream(pid: string, userInput: string, agentName: AgentName, se
 
             const projData = parseProjectInput(userInput);
             const newPid = store.createProject(projData.name, projData.genre, projData.premise, projData.style, projData.audience);
+            send({ type: "project_created", agent: agentName, id: newPid, name: projData.name });
             const summary = `✅ 已创建项目「${projData.name}」\n类型: ${projData.genre} | 设定: ${projData.premise}\n\n项目ID: ${newPid}\n\n📋 项目已创建，正在启动 Phase 1: 扫榜调研...`;
             send({ type: "answer_start", agent: agentName });
             emitTextAsTokens(send, agentName, summary);
@@ -876,14 +1100,14 @@ function buildSseStream(pid: string, userInput: string, agentName: AgentName, se
               store.takePendingGate(pid);
               try { store.updateProjectPhase(pid, gatePhase); } catch { /* ignore */ }
               send({ type: "gate_cleared", agent: agentName, phase: gatePhase });
-              const result = await executeWorkflow(pid, gatePhase as any, userInput, send);
+              const result = await executeWorkflow(pid, gatePhase as any, userInput, send, chapterCount);
               send({ type: "answer_start", agent: agentName });
               emitTextAsTokens(send, agentName, result);
               send({ type: "answer_end", agent: agentName });
               store.addMessage(pid, "assistant", result);
               break;
             }
-            const result = await executeWorkflow(pid, intent.phase, userInput, send);
+            const result = await executeWorkflow(pid, intent.phase, userInput, send, chapterCount);
             send({ type: "answer_start", agent: agentName });
             emitTextAsTokens(send, agentName, result);
             send({ type: "answer_end", agent: agentName });
@@ -904,7 +1128,7 @@ function buildSseStream(pid: string, userInput: string, agentName: AgentName, se
               store.takePendingGate(pid);
               try { store.updateProjectPhase(pid, gatePhase); } catch { /* ignore */ }
               send({ type: "gate_cleared", agent: agentName, phase: gatePhase });
-              const result = await executeWorkflow(pid, gatePhase as any, userInput, send);
+              const result = await executeWorkflow(pid, gatePhase as any, userInput, send, chapterCount);
               send({ type: "answer_start", agent: agentName });
               emitTextAsTokens(send, agentName, result);
               send({ type: "answer_end", agent: agentName });
@@ -912,7 +1136,7 @@ function buildSseStream(pid: string, userInput: string, agentName: AgentName, se
               break;
             }
             const state = store.getProjectState(pid);
-            const result = await executeWorkflow(pid, state.currentPhase, userInput, send);
+            const result = await executeWorkflow(pid, state.currentPhase, userInput, send, chapterCount);
             send({ type: "answer_start", agent: agentName });
             emitTextAsTokens(send, agentName, result);
             send({ type: "answer_end", agent: agentName });
@@ -925,8 +1149,12 @@ function buildSseStream(pid: string, userInput: string, agentName: AgentName, se
             // 普通聊天 → 降级到 LLM（模型无关兜底）
             // 记忆钩子: 检测用户消息里的创作指令 → 自动存长期记忆 (保证跨天/跨轮不丢)
             try { captureUserCreativeMemories(pid, userInput); } catch { /* 记忆保存失败不影响主流程 */ }
-            const messages = buildChatMessages(pid, sid, agentName, userInput);
-            await runAgentLoop({ pid, agentName, messages, depth: 0, runId, delegationLog: [], emit: send, sharedSteps: { value: 0 } });
+            const built = await buildChatMessages(pid, sid, agentName, userInput);
+            if (built.compact.compacted) {
+              send({ type: "observation", agent: agentName, tool: "context_compacted",
+                result: `上下文已自动压缩: ${built.compact.beforeTokens} → ${built.compact.afterTokens} tokens (窗口 ${Math.round(built.compact.window / 1000)}k, 早期 ${built.compact.dropped} 条压成摘要, 保留最近 ${built.compact.kept} 条)` });
+            }
+            await runAgentLoop({ pid, agentName, messages: built.messages, depth: 0, runId, delegationLog: [], emit: send, sharedSteps: { value: 0 } });
             break;
           }
         }
@@ -1063,7 +1291,14 @@ function captureUserCreativeMemories(pid: string, userInput: string): void {
   memory.saveLongTermMemory(pid, category, topic, text.slice(0, 500), "user", 7);
 }
 
-function buildChatMessages(pid: string, sid: string, agentName: AgentName, userInput: string): Array<{ role: string; content: string }> {
+/**
+ * 组装本轮上下文: 系统块(项目/记忆/素材/角色提示) + 历史对话。
+ * 历史不再写死 40 条, 而是按 token 预算装 —— 超过 128k 窗口的 75% 自动把早期对话压成滚动摘要
+ * (见 context/compact.ts)。短对话走零开销快路径, 不会多调一次 LLM。
+ */
+async function buildChatMessages(
+  pid: string, sid: string, agentName: AgentName, userInput: string,
+): Promise<{ messages: Array<{ role: string; content: string }>; compact: CompactInfo }> {
   const proj = getProject(pid);
   const memoryCtx = memory.getMemoryContext(pid);
   const sessionMems = memory.getSessionMemories(pid, sid);
@@ -1085,21 +1320,46 @@ function buildChatMessages(pid: string, sid: string, agentName: AgentName, userI
     messages.push({ role: "system", content: `【短期记忆】\n${sessionMems.map((m) => `- [${m.category}] ${m.topic}: ${m.content}`).join("\n")}` });
   }
 
+  // 【素材库】用户上传的对标书/参考资料 —— 以前只落库不注入, 模型永远"看不见"这些文件,
+  // 用户说"我上传的书你读一下"时它只能干瞪眼。这里给索引 + 每份开头 800 字, 全文让模型
+  // 自己用 read_source 翻页 (素材动辄几万字, 全塞进上下文会挤掉大纲和角色)。
+  const sources = store.listSources(pid);
+  if (sources.length) {
+    const blocks = sources.slice(0, 6).map((src) => {
+      const head = store.getSourceText(pid, src.source).slice(0, 800).replace(/\s+/g, " ").trim();
+      return `- 《${src.source}》 ${src.chars} 字 / ${src.chunks} 块\n  开头: ${head}`;
+    });
+    messages.push({
+      role: "system",
+      content: `【素材库 · 用户已上传, 可直接引用】\n${blocks.join("\n")}\n\n`
+        + `看全文或后面部分请调用工具 read_source(name="文件名", offset=起始字符, limit=读取字数, 默认 8000)。\n`
+        + `用户提到"我上传的书/素材/资料/对标文"时, 指的就是上面这些文件 —— 不要回答"我看不到附件"。`,
+    });
+  }
+
   const skillPrompts = getAgentSkillPrompts(agentName);
   const skillBlock = skillPrompts.length ? "\n\n" + skillPrompts.join("\n\n") : "";
   messages.push({ role: "system", content: getAgentPrompt(agentName) + skillBlock + "\n可用工具: " + AGENT_TOOLS[agentName].join(", ") + "\n需要调用工具时输出 JSON: {\"tool\": \"工具名\", \"args\": {...}}\n否则直接回复。" });
 
-  const histMsgs = store.listMessages(pid, 40);
+  // 历史: 取足够多 (由 token 预算决定真正塞多少), 过滤空 content / 工具行
+  const histMsgs = store.listMessages(pid, 600);
+  const history: Array<{ role: string; content: string; id?: string }> = [];
   for (const m of histMsgs) {
     const _toolName = (m as unknown as { tool_name?: string }).tool_name;
     // 过滤空 content (历史里可能残留 content="" 的行, agnes 校验会 400: "message content cannot be empty")
     if ((m.role === "user" || m.role === "assistant") && !_toolName && (m.content || "").trim().length > 0) {
-      messages.push({ role: m.role, content: m.content });
+      history.push({ role: m.role, content: m.content, id: (m as unknown as { id?: string }).id });
     }
   }
+  // 本轮用户消息已经在 buildSseStream 里落库, 这里会重复出现一次 → 去掉尾部那条, 下面统一补
+  while (history.length && history[history.length - 1]!.role === "user" && history[history.length - 1]!.content.trim() === userInput.trim()) {
+    history.pop();
+  }
 
-  messages.push({ role: "user", content: userInput });
-  return messages;
+  const compacted = await compactConversation(pid, sid, messages, history);
+  const out = compacted.messages as Array<{ role: string; content: string }>;
+  out.push({ role: "user", content: userInput });
+  return { messages: out, compact: compacted.info };
 }
 
 const SSE_HEADERS = { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no", Connection: "keep-alive" } as const;
@@ -1108,7 +1368,7 @@ app.post("/api/projects/:pid/chat", async (c) => {
   const pid = c.req.param("pid");
   // 项目必须存在
   if (!getProject(pid)) return c.json({ error: "项目不存在" }, 404);
-  let body: { input: string; agent?: string; sessionId?: string };
+  let body: { input: string; agent?: string; sessionId?: string; chapterCount?: number };
   try {
     body = await c.req.json();
   } catch {
@@ -1118,7 +1378,10 @@ app.post("/api/projects/:pid/chat", async (c) => {
   const agentName = (body.agent || DEFAULT_AGENT) as AgentName;
   if (!userInput) return c.json({ error: "缺少 input" }, 400);
   if (!isValid(agentName)) return c.json({ error: `无效 agent: ${agentName}` }, 400);
-  const stream = buildSseStream(pid, userInput, agentName, sessionId);
+  // 连续写作章数: 仅阶段 5 生效, 夹在 1~10 之间; 不传或非法值一律按 1 章处理
+  const rawCount = Number(body.chapterCount);
+  const chapterCount = Number.isFinite(rawCount) ? Math.max(1, Math.min(10, Math.floor(rawCount))) : 1;
+  const stream = buildSseStream(pid, userInput, agentName, sessionId, chapterCount);
   return new Response(stream, { headers: SSE_HEADERS });
 });
 
@@ -1315,12 +1578,33 @@ const port = s.serverPort;
 const BLUE = "\x1b[36m";
 const RESET = "\x1b[0m";
 const blue = (t: string) => `${BLUE}${t}${RESET}`;
+
+// 「天衍」像素招牌 —— 黑体 28px 点阵降采样后用块字符(█ ▀ ▄)拼成, 共 12 行 x 58 列。
+// 想改字: 用 canvas 渲染新字再阈值化即可, 别手绘 (手绘的汉字认不出来)。
+// 与 bin/banner.js 里的 BANNER_LINES 保持一致。
+const BANNER_LINES = [
+  "   ████████████████████           ▄██   ▀██▄  ▄▄▄▄▄▄▄▄",
+  "            ██                   ██▀      ▀█▀ ▀▀▀▀▀▀▀▀",
+  "            ██                 ▄█▀  ▄",
+  "            ██                     ▄██ ▄█▄   ▄▄▄▄▄▄▄▄▄▄",
+  " ████████████████████████         ▄█▀   ▀██▀ ▀▀▀▀▀██▀▀▀",
+  "           ████                 ▄███              ██",
+  "          ▄████▄               ██▀██      ▄       ██",
+  "         ▄██  ▀██                 ██      ██      ██",
+  "        ███▀   ▀██▄               ██     ██       ██",
+  "     ▄███▀       ▀██▄▄            ██    ██▀       ██",
+  "  ▄▄███▀           ▀███▄▄▄        ██   ██▀        ██",
+  "▀██▀▀                 ▀▀▀         ██   ▀▀      ████▀",
+];
+
 console.log(`\n`);
-console.log(`${blue("  ╔══════════════════════════════╗")}`);
-console.log(`${blue("  ║")}                            ${blue("║")}`);
-console.log(`${blue("  ║")}      ${blue("【  天  衍  】")}        ${blue("║")}`);
-console.log(`${blue("  ║")}                            ${blue("║")}`);
-console.log(`${blue("  ╚══════════════════════════════╝")}`);
+// 窄终端(装不下 58 列)不硬塞, 免得折行糊成一团
+if ((process.stdout.columns || 80) >= 62) {
+  BANNER_LINES.forEach((line) => console.log(blue(line)));
+  console.log(`\n   ${blue("天衍，群星旗下的多agent小说创作")}   ${blue("· 多 Agent 协同创作系统")}\n`);
+} else {
+  console.log(`${blue("  ✦ 天 衍 ✦")}  群星旗下的多agent小说创作 · 多 Agent 协同创作系统\n`);
+}
 console.log(`${blue(`  地址: http://localhost:${port}`)}`);
 console.log(`${blue(`  模型: ${s.defaultModel.model}`)}`);
 console.log(`${blue(`  数据: ${s.dataDir}`)}`);
@@ -1328,6 +1612,16 @@ console.log(`${blue(`  版本: v0.1.0`)}`);
 console.log(`\n`);
 serve({ fetch: app.fetch, port }, async () => {
   console.log(`${blue("  ✓ 服务已启动")}`);
+  // 沙箱补偿: 旧版本创建的项目还没有沙箱目录, 启动时统一补建;
+  // 同时回收"项目已删但目录还在"的孤儿, 避免磁盘越用越满。
+  try {
+    const all = listProjectSummaries();
+    for (const p of all) ensureSandbox(p.id);
+    const removed = purgeOrphanSandboxes(all.map((p) => p.id));
+    if (removed > 0) console.log(`${blue("  沙箱: 已回收 " + removed + " 个孤儿目录")}`);
+  } catch (e) {
+    console.log(`${blue("  沙箱: 初始化跳过 (" + (e as Error).message?.slice(0, 40) + ")")}`);
+  }
   // 乱码消息清理改为人工触发 (POST /api/admin/clean-garbled):
   // 启动自动删数据是"重新进入旧会话就丢"的隐患之一 — 脏数据保留, 想清再手动调接口
   // 自动拉起内嵌浏览器服务 (模拟真人), 搜索/扫榜 agent 可直接调用; 起不来自动降级

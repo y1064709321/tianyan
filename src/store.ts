@@ -147,6 +147,12 @@ export function initDb(): void {
     );
     CREATE INDEX IF NOT EXISTS idx_sm_project ON session_memories(project_id, session_id);
     CREATE INDEX IF NOT EXISTS idx_sm_topic ON session_memories(project_id, topic);
+    -- 上下文滚动摘要 (128k 窗口自动压缩用): 每个项目+会话一条, upto_id 记录已压缩到哪条消息
+    CREATE TABLE IF NOT EXISTS context_summaries (
+      project_id TEXT NOT NULL, session_id TEXT NOT NULL,
+      upto_id TEXT NOT NULL, summary TEXT NOT NULL, updated_at REAL,
+      PRIMARY KEY (project_id, session_id)
+    );
     -- 长期记忆 (persistent, 可被 supersede)
     CREATE TABLE IF NOT EXISTS long_term_memories (
       id TEXT PRIMARY KEY, project_id TEXT NOT NULL, category TEXT NOT NULL,
@@ -214,6 +220,33 @@ export function getProject(pid: string): Project | undefined {
   return getDb().prepare("SELECT * FROM projects WHERE id=?").get(pid) as Project | undefined;
 }
 
+/**
+ * 局部更新项目字段 —— 只更新传进来的那几个, undefined 的列原样不动。
+ *
+ * 之前只有 createProject, 项目建完就再也改不了题材/文风/核心设定 (「项目设置」那行
+ * 只是展示)。题材库扩到 100+ 个标签之后, 老项目还用着旧词, 没有更新接口就没法修正。
+ */
+export function updateProject(
+  pid: string,
+  patch: { name?: string; genre?: string; style?: string; premise?: string; audience?: string },
+): void {
+  const cols: Array<[string, string | undefined]> = [
+    ["name", patch.name],
+    ["genre", patch.genre],
+    ["style", patch.style],
+    ["premise", patch.premise],
+    ["audience", patch.audience],
+  ];
+  const sets: string[] = [];
+  const vals: string[] = [];
+  for (const [col, v] of cols) {
+    if (typeof v === "string") { sets.push(`${col}=?`); vals.push(v); }
+  }
+  if (!sets.length) return;
+  vals.push(pid);
+  getDb().prepare(`UPDATE projects SET ${sets.join(", ")} WHERE id=?`).run(...vals);
+}
+
 export function getProjectState(pid: string): {
   currentPhase: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
   hasCharacters: boolean;
@@ -246,6 +279,59 @@ export function updateProjectPhase(pid: string, phase: number): void {
 
 export function listProjects(): Project[] {
   return getDb().prepare("SELECT * FROM projects ORDER BY created_at DESC").all() as Project[];
+}
+
+/**
+ * 项目列表摘要 —— 侧边栏项目区专用。
+ *
+ * 为什么不用 listProjects(): projects 表是 snake_case, `SELECT *` 直接 cast 成
+ * Project 后 createdAt 其实是 undefined, 前端拿不到任何时间信息。而且列表要展示
+ * "几章/多少字/多久前动过", 这些都在别的表里, 一次 join 出来比前端 N+1 请求划算。
+ *
+ * updatedAt 取 "建项时间 / 最后一条消息 / 最后改过的章节" 三者最大值 ——
+ * 光看 created_at 的话, 天天写的项目会一直排在最后, 排序完全失真。
+ */
+export interface ProjectSummary {
+  id: string;
+  name: string;
+  genre: string;
+  audience: string;
+  createdAt: number;
+  updatedAt: number;
+  chapterCount: number;
+  wordCount: number;
+}
+
+export function listProjectSummaries(): ProjectSummary[] {
+  const rows = getDb().prepare(`
+    SELECT p.id AS id,
+           p.name AS name,
+           COALESCE(p.genre, '') AS genre,
+           COALESCE(p.audience, '') AS audience,
+           COALESCE(p.created_at, 0) AS created_at,
+           MAX(
+             COALESCE(p.created_at, 0),
+             COALESCE((SELECT MAX(m.created_at) FROM messages m WHERE m.project_id = p.id), 0),
+             COALESCE((SELECT MAX(c.updated_at) FROM chapters c WHERE c.project_id = p.id), 0)
+           ) AS updated_at,
+           (SELECT COUNT(*) FROM chapters c WHERE c.project_id = p.id) AS chapter_count,
+           COALESCE((SELECT SUM(LENGTH(c.content)) FROM chapters c WHERE c.project_id = p.id), 0) AS word_count
+    FROM projects p
+    ORDER BY updated_at DESC
+  `).all() as Array<{
+    id: string; name: string; genre: string; audience: string;
+    created_at: number; updated_at: number; chapter_count: number; word_count: number;
+  }>;
+  return rows.map((r) => ({
+    id: r.id,
+    name: r.name,
+    genre: r.genre,
+    audience: r.audience,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+    chapterCount: r.chapter_count,
+    wordCount: r.word_count,
+  }));
 }
 
 export function deleteProject(pid: string): void {
@@ -475,6 +561,22 @@ export function getCharacterProfile(pid: string, name: string): CharacterProfile
   return getDb().prepare("SELECT * FROM character_profiles WHERE project_id=? AND name=?").get(pid, name) as CharacterProfile | undefined;
 }
 
+// ----- 上下文滚动摘要 (自动压缩) -----
+export function getContextSummary(pid: string, sid: string): { uptoId: string; summary: string } | undefined {
+  const row = getDb().prepare(
+    "SELECT upto_id, summary FROM context_summaries WHERE project_id=? AND session_id=?"
+  ).get(pid, sid) as { upto_id: string; summary: string } | undefined;
+  return row ? { uptoId: row.upto_id, summary: row.summary } : undefined;
+}
+
+export function saveContextSummary(pid: string, sid: string, uptoId: string, summary: string): void {
+  getDb().prepare(
+    `INSERT INTO context_summaries (project_id, session_id, upto_id, summary, updated_at)
+     VALUES (?,?,?,?,?)
+     ON CONFLICT(project_id, session_id) DO UPDATE SET upto_id=excluded.upto_id, summary=excluded.summary, updated_at=excluded.updated_at`
+  ).run(pid, sid, uptoId, summary, now());
+}
+
 // ----- Chunks (检索用) -----
 export function listChunks(pid: string): Chunk[] {
   return getDb().prepare("SELECT * FROM chunks WHERE project_id=? ORDER BY idx").all(pid) as Chunk[];
@@ -486,6 +588,30 @@ export function addChunk(pid: string, source: string, idx: number, text: string)
     "INSERT INTO chunks (id,project_id,source,idx,text,created_at) VALUES (?,?,?,?,?,?)"
   ).run(id, pid, source, idx, text, now());
   return id;
+}
+
+/**
+ * 素材库索引: 按文件名聚合 chunks。
+ * 前端左侧「素材库」和模型上下文共用这一份口径 —— 以前前端读 p.sources, 而
+ * /api/projects/:pid 根本不返回 sources, 于是"上传成功但素材库永远 0"。
+ */
+export function listSources(pid: string): Array<{ source: string; chunks: number; chars: number }> {
+  return getDb().prepare(
+    "SELECT source, COUNT(*) AS chunks, SUM(LENGTH(text)) AS chars FROM chunks WHERE project_id=? GROUP BY source ORDER BY MIN(created_at)"
+  ).all(pid) as Array<{ source: string; chunks: number; chars: number }>;
+}
+
+/** 取某个素材的全文 (chunks 按 idx 拼回原文) */
+export function getSourceText(pid: string, source: string): string {
+  const rows = getDb().prepare(
+    "SELECT text FROM chunks WHERE project_id=? AND source=? ORDER BY idx"
+  ).all(pid, source) as Array<{ text: string }>;
+  return rows.map((r) => r.text).join("");
+}
+
+/** 删掉某个素材 (同名重传前先清旧块, 避免叠加) */
+export function deleteSource(pid: string, source: string): number {
+  return getDb().prepare("DELETE FROM chunks WHERE project_id=? AND source=?").run(pid, source).changes;
 }
 
 // ----- Foreshadowings -----

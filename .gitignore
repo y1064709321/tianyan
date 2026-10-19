@@ -1,4 +1,5 @@
 node_modules/
+.runtime/
 .venv/
 .venv-scrapling/
 .npm-cache/
@@ -18,3 +19,4 @@ preview_screenshots/
 # 密钥配置文件 (可能含明文 API key); config.example.yaml 不忽略
 config.yaml
 .workbuddy/
+.workbuddy-ai/

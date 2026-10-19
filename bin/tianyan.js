@@ -10,6 +10,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import * as readline from "node:readline";
+import { printBanner } from "./banner.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
@@ -130,13 +131,7 @@ function ask(rl, question, defaultVal) {
 
 async function interactiveWizard() {
   console.log("");
-  console.log("");
-  console.log(c("cyan", "  ╔══════════════════════════════╗"));
-  console.log(c("cyan", "  ║") + "                            " + c("cyan", "║"));
-  console.log(c("cyan", "  ║") + "      " + c("cyan", "【  天  衍  】") + "        " + c("cyan", "║"));
-  console.log(c("cyan", "  ║") + "                            " + c("cyan", "║"));
-  console.log(c("cyan", "  ╚══════════════════════════════╝"));
-  console.log("");
+  printBanner((t) => c("cyan", t));
 
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
@@ -290,11 +285,7 @@ function startService(env, port, noBrowser) {
 
   const url = `http://localhost:${port}`;
   console.log("");
-  console.log(c("cyan", "  ╔══════════════════════════════╗"));
-  console.log(c("cyan", "  ║") + "                            " + c("cyan", "║"));
-  console.log(c("cyan", "  ║") + "      " + c("cyan", "【  天  衍  】") + "        " + c("cyan", "║"));
-  console.log(c("cyan", "  ║") + "                            " + c("cyan", "║"));
-  console.log(c("cyan", "  ╚══════════════════════════════╝"));
+  printBanner((t) => c("cyan", t), "");
   console.log(`${c("cyan", "  地址:")} ${c("cyan", url)}`);
   console.log("");
 

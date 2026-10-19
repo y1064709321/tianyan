@@ -54,6 +54,10 @@ body{font-family:var(--sans);background:var(--paper);color:var(--ink);font-size:
   .sidebar{transform:translateX(0)}
   .sidebar-close{display:inline-block}
   #menu-btn{display:none !important}
+  /* 侧栏是 position:fixed, 不占文档流 —— 主区必须显式让出 264px,
+     否则顶栏(z-index 60)会压住侧栏顶部, 聊天区左半边也被侧栏盖住。
+     用 .app > .main 限定, 别让任何带 .main 类名的子元素被误伤 */
+  .app > .main{margin-left:264px}
 }
 .brand{font-size:16px;font-weight:700;padding:6px 6px 16px;display:flex;align-items:center;gap:8px;
   font-family:var(--serif);color:var(--ink);letter-spacing:.6px;
@@ -80,12 +84,7 @@ body{font-family:var(--sans);background:var(--paper);color:var(--ink);font-size:
   .btn.icon-btn.with-label{padding:7px 8px}
   .actions .btn{font-size:12px;padding:6px 8px}
 }
-.proj-list{margin-top:10px}
-.proj-item{padding:8px 10px;border-radius:6px;cursor:pointer;margin-bottom:4px;border:1px solid transparent}
-.proj-item:hover{background:var(--paper3)}
-.proj-item.active{background:var(--paper3);border-color:var(--accent)}
-.proj-item .pn{font-weight:600;font-size:13px}
-.proj-item .pg{font-size:11px;color:var(--muted)}
+/* 旧的简易项目列表样式已由下方「侧边栏分区」区块接管 (勿在此重复定义 .proj-item) */
 .sidebar-section{margin-top:16px}
 .section-title{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
 .chap-list .chap-item,.elem-list .elem-item{padding:6px 8px;border-radius:5px;cursor:pointer;font-size:12px}
@@ -446,6 +445,79 @@ body{font-family:var(--sans);background:var(--paper);color:var(--ink);font-size:
 .proj-new-btn:hover{background:var(--accent);color:#fff}
 .proj-menu{max-height:240px;overflow-y:auto}
 
+/* ============ 侧边栏分区: 项目区 / 内容区 ============
+   形制取自「工作区」列表: 分区标题(左标题 + 右图标动作) → 常驻条目列表。
+   条目 = 圆形印章徽标 + 主名 + 副信息 + 右侧相对时间, 当前项整行高亮。
+   目的: 所有项目一眼可见。旧版只有一个下拉, 新建一个之后旧项目就"看不见"了。 */
+.side-sec{display:flex;flex-direction:column;min-height:0}
+.proj-sec{flex-shrink:0;margin-bottom:10px}
+.tree-sec{flex:1;min-height:0;border-top:1px solid var(--border);padding-top:8px}
+
+.sec-head{display:flex;align-items:center;justify-content:space-between;gap:6px;
+  padding:0 6px 7px;flex-shrink:0}
+.sec-title{display:flex;align-items:center;gap:6px;font-size:11px;font-weight:600;
+  letter-spacing:1.4px;color:var(--muted);font-family:var(--sans);white-space:nowrap}
+.sec-count{font-size:10px;font-weight:500;letter-spacing:0;color:var(--muted);
+  background:var(--paper3);border:1px solid var(--border);border-radius:9px;
+  padding:0 5px;line-height:15px}
+.sec-acts{display:flex;align-items:center;gap:5px}
+.sec-btn{border:none;background:transparent;color:var(--muted);cursor:pointer;
+  font-size:11.5px;font-family:var(--sans);padding:3px 6px;border-radius:5px;
+  line-height:1.2;transition:.15s;white-space:nowrap}
+.sec-btn.icon{font-size:14px;padding:2px 5px}
+/* 左侧栏的操作按钮(＋设定 / ＋章节): 原来 11.5px 灰字太弱, 容易"看不见"。
+   给描边 + 底色 + 加大字号, 保证在浅色背景上一眼能找到。 */
+.sec-btn.act-btn{font-size:12px;font-weight:600;color:var(--ink);
+  background:var(--paper3);border:1px solid var(--border);
+  padding:3px 8px;border-radius:6px;line-height:1.35}
+.sec-btn.act-btn:hover{background:var(--accent);color:#fff;border-color:var(--accent)}
+/* 新建项目按钮: 原来的 14px+2px padding 太难点, 放大到易点击尺寸 */
+#proj-new-btn{font-size:17px;font-weight:600;padding:2px 8px;min-width:26px;
+  line-height:1.35;border-radius:6px}
+#proj-new-btn:hover{background:var(--accent);color:#fff}
+.sec-btn:hover{background:var(--paper3);color:var(--accent)}
+.sec-btn.on{background:var(--paper4);color:var(--accent)}
+
+.proj-search{padding:0 4px 8px;flex-shrink:0}
+.proj-search input{width:100%;box-sizing:border-box;background:var(--paper);
+  border:1px solid var(--border);border-radius:6px;padding:6px 9px;font-size:12.5px;
+  color:var(--ink);font-family:var(--sans);outline:none;transition:.15s}
+.proj-search input:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(161,61,61,.1)}
+
+.proj-list{display:flex;flex-direction:column;gap:4px;padding:0 2px 4px;
+  max-height:34vh;overflow-y:auto;overflow-x:hidden}
+.proj-item{position:relative;display:flex;align-items:center;gap:9px;
+  padding:7px 8px;border-radius:7px;cursor:pointer;color:var(--ink);
+  border:1px solid transparent;transition:background .15s,border-color .15s}
+.proj-item:hover{background:var(--paper3);border-color:var(--border)}
+.proj-item.active{background:linear-gradient(100deg,var(--paper3),var(--paper4));
+  border-color:var(--border2);box-shadow:inset 2px 0 0 var(--accent),0 1px 4px rgba(46,31,21,.09)}
+/* 圆形印章徽标: 取项目名首字 */
+.pbadge{width:26px;height:26px;flex-shrink:0;border-radius:50%;
+  display:flex;align-items:center;justify-content:center;
+  font-family:var(--serif);font-size:13px;font-weight:700;color:var(--accent);
+  background:radial-gradient(circle at 34% 28%,#fffaee,var(--paper3));
+  border:1px solid var(--border2);box-shadow:0 1px 2px rgba(46,31,21,.13)}
+.proj-item.active .pbadge{color:#f6efd9;border-color:var(--accent);
+  background:linear-gradient(135deg,var(--accent),#7a2a2a);
+  box-shadow:0 1px 4px rgba(161,61,61,.3)}
+.pbody{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px}
+.pname{font-size:12.8px;font-weight:600;line-height:1.25;color:var(--ink);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.proj-item.active .pname{color:var(--accent)}
+.psub{font-size:10.5px;line-height:1.2;color:var(--muted);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pmeta{font-size:10.5px;color:var(--muted);flex-shrink:0;white-space:nowrap;
+  font-variant-numeric:tabular-nums;transition:opacity .15s}
+.proj-item:hover .pmeta{opacity:0}
+.pdel{position:absolute;right:5px;top:50%;transform:translateY(-50%);
+  opacity:0;border:none;background:transparent;color:var(--muted);cursor:pointer;
+  font-size:11px;padding:3px 4px;border-radius:4px;line-height:1;transition:.15s}
+.proj-item:hover .pdel{opacity:1}
+.pdel:hover{color:#b3402f;background:rgba(179,64,47,.1)}
+.proj-list-empty{font-size:11.5px;color:var(--muted);padding:8px 10px;line-height:1.6;
+  border:1px dashed var(--border);border-radius:7px;text-align:center}
+
 .tree{flex:1;overflow-y:auto;padding:4px 4px 12px;font-size:13px;font-family:var(--sans)}
 .tree-empty{text-align:center;color:var(--muted);padding:40px 16px}
 .tree-empty-icon{font-size:36px;opacity:.4;margin-bottom:8px}
@@ -786,6 +858,54 @@ body{font-family:var(--sans);background:var(--paper);color:var(--ink);font-size:
   font-family:var(--sans);cursor:pointer;color:var(--ink2);transition:all .15s}
 .aud-btn.active{background:var(--accent);color:#fff;font-weight:600}
 .aud-btn:not(.active):hover{background:rgba(0,0,0,.05)}
+
+/* ============ 题材选择器: 分组标签 + 自定义 ============
+   形制参考番茄/起点的新建作品页: 左侧分组名, 右侧可点选的圆角标签。
+   主分类单选(朱砂实心), 其余分组可多选(浅色描边), 最上面一行是"已选"摘要, 点标签可取消。 */
+.modal-card.wide{width:540px;max-height:88vh;overflow-y:auto}
+.field-block{margin-bottom:12px}
+.fb-head{display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin-bottom:6px}
+.fb-title{font-size:var(--fs-md);color:var(--ink2);font-family:var(--sans);font-weight:600}
+.fb-hint{font-size:11px;color:var(--muted);font-family:var(--sans)}
+
+.gp-picked{display:flex;flex-wrap:wrap;gap:5px;align-items:center;min-height:30px;
+  padding:6px 8px;border:1px dashed var(--border);border-radius:6px;background:rgba(255,255,255,.32)}
+.gp-picked-empty{font-size:11.5px;color:var(--muted);font-family:var(--sans)}
+.gp-tag{display:inline-flex;align-items:center;gap:4px;font-size:12px;font-family:var(--sans);
+  padding:3px 8px;border-radius:12px;background:var(--paper4);color:var(--ink);cursor:pointer;
+  border:1px solid var(--border2);transition:.15s}
+.gp-tag.core{background:linear-gradient(135deg,var(--accent),#7a2a2a);color:#f6efd9;
+  border-color:var(--accent);font-weight:600}
+.gp-tag:hover{opacity:.82}
+.gp-tag i{font-style:normal;font-size:12px;line-height:1;opacity:.6}
+.gp-tag:hover i{opacity:1}
+
+.gp-body{max-height:300px;overflow-y:auto;margin-top:8px;padding-right:2px;
+  border:1px solid var(--border);border-radius:6px;background:var(--paper)}
+.gp-group{padding:8px 10px;border-bottom:1px dashed var(--border)}
+.gp-group:last-child{border-bottom:none}
+/* 分组标题吸顶: 标签一多要滚, 滚下去还能看出这是哪一组 */
+.gp-gname{position:sticky;top:-8px;z-index:1;background:var(--paper);
+  display:flex;align-items:center;gap:5px;font-size:11px;color:var(--muted);
+  font-family:var(--sans);letter-spacing:.6px;padding:4px 0 6px;margin:-4px 0 2px}
+.gp-gname i{font-style:normal;font-size:9.5px;color:var(--accent);border:1px solid var(--accent);
+  border-radius:3px;padding:0 3px;letter-spacing:0;opacity:.85}
+.gp-chips{display:flex;flex-wrap:wrap;gap:5px}
+.gp-chip{font-size:12px;font-family:var(--sans);padding:4px 10px;border-radius:13px;cursor:pointer;
+  background:var(--paper2);border:1px solid var(--border);color:var(--ink2);
+  transition:.15s;line-height:1.35;white-space:nowrap}
+.gp-chip:hover{border-color:var(--border2);background:var(--paper3)}
+.gp-chip.on{background:linear-gradient(135deg,var(--accent),#7a2a2a);border-color:var(--accent);
+  color:#f6efd9;font-weight:600;box-shadow:0 1px 4px rgba(161,61,61,.28)}
+
+.gp-custom{display:flex;gap:6px;margin-top:8px}
+.gp-custom input{flex:1;margin-top:0 !important}
+.gp-custom .btn{flex-shrink:0;align-self:center}
+
+/* 弹窗内容长(题材标签多)时, 操作栏吸在卡片底部 —— 否则「保存」被挤到屏幕外, 得先滚动才能点 */
+.modal-card.wide .modal-actions{position:sticky;bottom:-20px;z-index:3;
+  background:var(--paper2);border-top:1px solid var(--border);
+  padding:10px 0 6px;margin-top:12px}
 .scrollbar::-webkit-scrollbar{width:8px}
 ::-webkit-scrollbar{width:8px;height:8px}
 ::-webkit-scrollbar-thumb{background:var(--paper4);border-radius:4px}

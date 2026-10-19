@@ -80,7 +80,11 @@ const PHASE_ROUTES: Record<number, PhaseRoute> = {
   2: { agent: "story-architect", tool: "analyze_novel", taskPrefix: "拆书解构" },
   3: { agent: "character-designer", tool: "manage_character", taskPrefix: "定文风定位/角色架构" },
   4: { agent: "story-architect", tool: "generate_outline", taskPrefix: "大纲搭建" },
-  5: { agent: "narrative-writer", tool: "ghostwrite", taskPrefix: "正文写作（story-explorer预加载上下文）" },
+  // 阶段 5 走 continue_writing, 不走 ghostwrite:
+  //   continue_writing 才有 buildWritingContext 三层滚动注入 (远章摘要 + 近2章原文 +
+  //   角色滚动状态 + 未回收伏笔) 和写后闭环 (摘要入库 + 角色状态更新);
+  //   ghostwrite 只有简版上下文且没有写后闭环 —— 连续写几章必然越写越偏、前后矛盾。
+  5: { agent: "narrative-writer", tool: "continue_writing", taskPrefix: "正文写作（story-explorer预加载上下文）" },
   // 对齐 workflow.ts PHASES: 阶段 6 初审归审核 agent, 阶段 8 终审归主 Agent
   6: { agent: "consistency-checker", tool: "review_chapter", taskPrefix: "初审质检" },
   7: { agent: "consistency-checker", tool: "quality_check", taskPrefix: "36维质检" },
@@ -93,6 +97,8 @@ export async function executeWorkflow(
   phase: Phase,
   userInput: string,
   emit: (evt: SSEEvent) => void,
+  /** 仅阶段 5 生效: 一次连续写多少章 (1~10)。每章独立构建上下文, 互不累积。 */
+  chapterCount = 1,
 ): Promise<string> {
   const proj = store.getProject(pid);
   if (!proj) return JSON.stringify({ error: "项目不存在" });
@@ -139,16 +145,30 @@ export async function executeWorkflow(
       break;
     }
     case 5: {
+      // continue_writing 的参数是 { chapter_id, instruction, length, replace }。
+      // 空章节用 outline 拼成 instruction 传入, 而不是 ghostwrite 的 outline_text/word_count。
       const lastChapter = chapters[chapters.length - 1];
       if (lastChapter?.content) {
-        toolName === "continue_writing" as string;
-        toolArgs = { chapter_id: lastChapter.id, instruction: userInput || "续写下一段", length: 2000 };
+        // 已有正文 → 追加续写最后一章
+        toolArgs = { chapter_id: lastChapter.id, instruction: userInput || "续写本段", length: 2000 };
         inputSummary = `续写「${lastChapter.title}」`;
       } else {
-        const firstEmpty = chapters.find(c => !c.content) || lastChapter;
-        const outlineText = firstEmpty?.outline || userInput || "按照大纲创作";
-        toolArgs = { outline_text: outlineText, word_count: 3000, chapter_id: firstEmpty?.id };
-        inputSummary = `创作「${firstEmpty?.title || '新章节'}」`;
+        // 尚无正文 → 挑第一个空章节开写 (按 idx 升序, 保证按大纲顺序推进)
+        const firstEmpty = chapters.filter(c => !c.content).sort((a, b) => a.idx - b.idx)[0] || lastChapter;
+        if (firstEmpty) {
+          const outlineText = firstEmpty.outline || userInput || "按照大纲创作";
+          toolArgs = {
+            chapter_id: firstEmpty.id,
+            instruction: `按本章大纲写作：${outlineText}`,
+            length: 3000,
+          };
+          inputSummary = `创作「${firstEmpty.title}」`;
+        } else {
+          // 一章都没有 → 先建一个空章节作为落点, 否则 continue_writing 会自己造"第一章"
+          const newId = store.addChapter(pid, `第1章`, 1, userInput || "", "");
+          toolArgs = { chapter_id: newId, instruction: `按大纲写作：${userInput || "第一章"}`, length: 3000 };
+          inputSummary = "创作「第1章」";
+        }
       }
       break;
     }
@@ -189,26 +209,102 @@ export async function executeWorkflow(
   const t0 = Date.now();
   
   if (phase === 5) {
-    // Step 1: story-explorer 加载上下文（只读，为写作准备资料）
-    emit({ type: "sub_agent_start", agent: "story-explorer", task: "加载项目上下文、角色状态、伏笔、风格缓存", depth: 1 });
-    let contextResult: string;
-    try {
-      contextResult = await dispatchTool(pid, "load_context", {}, "story-explorer");
-    } catch (e) {
-      contextResult = JSON.stringify({ error: `上下文加载异常: ${(e as Error).message}` });
+    // ---- 连续写 N 章 ----
+    // 每章都是独立一轮: 重新读章节表 → 重新挑"第一个空章节" → continue_writing 内部
+    // 重新 buildWritingContext(滚动注入摘要/近文/角色状态/伏笔) → 写完落库 + 摘要 + 状态。
+    // 关键: 绝不把上一章的 toolArgs 或上下文带进下一章, 否则章节越长上下文越脏。
+    const totalRounds = Math.max(1, Math.min(10, Math.floor(chapterCount) || 1));
+    const written: Array<{ idx: number; title: string; chars: number }> = [];
+    const errors: string[] = [];
+
+    for (let round = 1; round <= totalRounds; round++) {
+      // 每轮重新取状态, 上一轮写完的章节已入库/摘要已落库
+      const chsNow = store.listChapters(pid);
+      // 选目标章节: 第一个没正文的 (按 idx); 全都写了就续写最后一章
+      const target = chsNow.filter(c => !c.content).sort((a, b) => a.idx - b.idx)[0]
+        || chsNow[chsNow.length - 1];
+
+      if (!target) {
+        errors.push(`第 ${round} 轮: 项目里没有任何章节, 无法写作 (请先生成大纲)`);
+        break;
+      }
+
+      // 已写满目标章数就停
+      if (written.length > 0 && !chsNow.some(c => !c.content)) break;
+
+      const isAppend = Boolean(target.content);
+      const outlineText = target.outline || "";
+      const roundArgs = isAppend
+        ? { chapter_id: target.id, instruction: userInput || "续写本段", length: 2000 }
+        : {
+            chapter_id: target.id,
+            instruction: outlineText ? `按本章大纲写作：${outlineText}` : (userInput || "按照大纲创作本章正文"),
+            length: 3000,
+          };
+
+      emit({
+        type: "observation", agent: "orchestrator", tool: "chapter_progress",
+        result: `【第 ${round}/${totalRounds} 轮】${isAppend ? "续写" : "创作"}「${target.title}」(第${target.idx}章)`,
+      });
+
+      // Step 1: story-explorer 加载上下文（只读，为写作准备资料）
+      emit({ type: "sub_agent_start", agent: "story-explorer", task: "加载项目上下文、角色状态、伏笔、风格缓存", depth: 1 });
+      let contextResult: string;
+      try {
+        contextResult = await dispatchTool(pid, "load_context", {}, "story-explorer");
+      } catch (e) {
+        contextResult = JSON.stringify({ error: `上下文加载异常: ${(e as Error).message}` });
+      }
+      emit({ type: "observation", agent: "story-explorer", tool: "load_context", result: contextResult.slice(0, 2000) });
+      emit({ type: "sub_agent_done", agent: "story-explorer", result: "上下文已加载", durationMs: 0 });
+
+      // Step 2: narrative-writer 写作
+      emit({ type: "sub_agent_start", agent: "narrative-writer", task: `第${target.idx}章 ${target.title}`, depth: 1 });
+      const roundT0 = Date.now();
+      let roundResult: string;
+      try {
+        roundResult = await executePhaseWithAgent(pid, "narrative-writer", toolName, roundArgs, `第${target.idx}章 ${target.title}`, emit);
+      } catch (e) {
+        roundResult = JSON.stringify({ error: `写作异常: ${(e as Error).message}` });
+      }
+      emit({ type: "observation", agent: "narrative-writer", tool: toolName, result: roundResult.slice(0, 2000) });
+      emit({ type: "sub_agent_done", agent: "narrative-writer", result: roundResult.slice(0, 500), durationMs: Date.now() - roundT0 });
+
+      // 记录本轮结果
+      try {
+        const parsed = JSON.parse(roundResult) as { error?: string; chars?: number; text?: string };
+        if (parsed.error) {
+          errors.push(`第${target.idx}章「${target.title}」: ${parsed.error}`);
+        } else {
+          written.push({ idx: target.idx, title: target.title, chars: Number(parsed.chars) || (parsed.text || "").length });
+        }
+      } catch {
+        written.push({ idx: target.idx, title: target.title, chars: roundResult.length });
+      }
+
+      // 最后一轮之外, 给用户一个中断点提示
+      if (round < totalRounds && written.length > 0) {
+        emit({
+          type: "observation", agent: "orchestrator", tool: "chapter_progress",
+          result: `已完成 ${written.length}/${totalRounds} 章, 继续下一章...`,
+        });
+      }
     }
-    emit({ type: "observation", agent: "story-explorer", tool: "load_context", result: contextResult.slice(0, 2000) });
-    emit({ type: "sub_agent_done", agent: "story-explorer", result: "上下文已加载", durationMs: 0 });
-    
-    // Step 2: narrative-writer 在 agent loop 中写作（有思考过程）
-    emit({ type: "sub_agent_start", agent: "narrative-writer", task: inputSummary, depth: 1 });
-    try {
-      result = await executePhaseWithAgent(pid, "narrative-writer", toolName, toolArgs, inputSummary, emit);
-    } catch (e) {
-      result = JSON.stringify({ error: `写作异常: ${(e as Error).message}` });
-    }
-    emit({ type: "observation", agent: "narrative-writer", tool: toolName, result: result.slice(0, 2000) });
-    emit({ type: "sub_agent_done", agent: "narrative-writer", result: result.slice(0, 500), durationMs: Date.now() - t0 });
+
+    // 汇总结果 (供后续审核链路与前端展示)
+    const summary = {
+      chaptersWritten: written.length,
+      chapters: written,
+      errors,
+      requested: totalRounds,
+    };
+    result = JSON.stringify(summary);
+    // 供审核链路使用: 用最后一章的参数
+    const lastChForReview = store.listChapters(pid).slice(-1)[0];
+    toolArgs = lastChForReview
+      ? { chapter_id: lastChForReview.id, instruction: userInput || "", length: 3000 }
+      : {};
+    emit({ type: "observation", agent: "orchestrator", tool: "chapter_progress", result: `本轮共完成 ${written.length}/${totalRounds} 章` });
   } else {
     // 其他阶段: 直接执行工具（确定性路由）
     emit({ type: "sub_agent_start", agent: agentName, task: inputSummary, depth: 1 });

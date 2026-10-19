@@ -56,6 +56,12 @@ export interface Settings {
   agents: Record<string, Partial<AgentConfig>>;
   /** 档位→模型 映射: 未配置档位时落回 defaultModel (向后兼容) */
   modelTiers?: import("./types.js").ModelTierMap;
+  /** 模型上下文窗口 (tokens)。默认 128000 — 超过比例阈值自动压缩早期对话 */
+  contextWindow?: number;
+  /** 触发自动压缩的阈值比例 (占 contextWindow), 默认 0.75 */
+  contextCompactRatio?: number;
+  /** 压缩后保留最近对话的比例 (占 contextWindow), 默认 0.35 */
+  contextKeepRatio?: number;
 }
 
 // ----- Agent -----
@@ -286,7 +292,9 @@ export type SSEEvent =
   | { type: "model_picked"; agent: AgentName; tier: string; model: string }
   // ===== LLM 断线自动重连提示 (前端转圈条) =====
   | { type: "llm_reconnecting"; agent: AgentName; attempt: number; max: number; interval_s: number }
-  | { type: "llm_reconnect_ok"; agent: AgentName };
+  | { type: "llm_reconnect_ok"; agent: AgentName }
+  // 聊天里新建了项目 (前端据此刷新项目列表; run 结束后再切过去, 避免打断当前流)
+  | { type: "project_created"; agent: AgentName; id: string; name: string };
 
 // ----- LLM -----
 export interface LLMResponse {

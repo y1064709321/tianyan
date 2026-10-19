@@ -48,6 +48,8 @@ console.warn = function(...args) {
 };
 
 let currentProject = null;
+// 聊天里新建了项目时记下来, 等本轮 run 结束再切过去 (中途切会清掉正在流式输出的对话)
+let pendingSwitchPid = null;
 let chatHistory = [];
 let config = { default: "", models: [], ready: true };
 let agentsList = [];
@@ -177,48 +179,124 @@ const AGENT_ICONS = {
   worldbuilder: "🌐", // 兼容旧名
   planner: "📐", writer: "✍️", editor: "🔧",
 };
-// ============ 小说分类数据 ============
-const GENRE_DATA = {
-  "男频": {
-    "主分类": [
-      "西方奇幻","东方仙侠","科幻末世","男频衍生","都市高武",
-      "悬疑灵异","悬疑脑洞","抗战谍战","历史古代","历史脑洞",
-      "都市种田","都市脑洞","都市日常","玄幻脑洞","战神赘婿",
-      "动漫衍生","游戏体育","传统玄幻","都市修真"
-    ],
-    "主题": [
-      "衍生","仕途","综影视","天灾","第一人称","赛博朋克",
-      "第四天灾","规则怪谈","搞笑轻松","古代","悬疑",
-      "克苏鲁","都市异能","末日求生","灵气复苏"
-    ]
-  },
-  "女频": {
-    "主分类": [
-      "女频悬疑","古风世情","科幻末世","女频衍生","民国言情",
-      "悬疑脑洞","青春甜宠","双男主","古言脑洞","现言脑洞",
-      "玄幻言情","宫斗宅斗","豪门总裁","动漫衍生","星光璀璨",
-      "游戏体育","职场婚恋","双女主","年代","种田","快穿"
-    ],
-    "主题": [
-      "古言权谋","悬疑恋爱","纯爱","衍生","仕途",
-      "综影视","天灾","第一人称","赛博朋克","规则怪谈",
-      "搞笑轻松","古代","悬疑","谍战","职场商战"
-    ]
-  }
+// ============ 题材库 (参考番茄/起点的分类体系) ============
+// 每组 { key, name, single, items }: single=true 只能选一个 (主分类), 其余可多选。
+// 顺序 = 展示顺序。前端不做白名单校验 —— genre 落库是自由文本, 后端只按 / 、 , 切开取第一个
+// 当扫榜分类 (见 index.ts 的 scanGenre), 所以自定义词不会把任何流程搞坏。
+const GENRE_LIB = {
+  "男频": [
+    { key: "main", name: "主分类", single: true, items: [
+      "东方仙侠", "传统玄幻", "玄幻脑洞", "都市修真", "都市高武", "都市异能", "都市日常", "都市种田", "都市脑洞",
+      "战神赘婿", "悬疑灵异", "悬疑脑洞", "诡秘悬疑", "科幻末世", "星际文明", "抗战谍战", "谍战特工",
+      "历史古代", "历史脑洞", "架空历史", "王朝争霸", "西方奇幻", "剑与魔法", "史诗奇幻", "高武世界",
+      "异世大陆", "传统武侠", "国术无双", "修真文明", "幻想修仙", "现实百态", "电子竞技", "体育竞技",
+      "男频衍生", "动漫衍生", "诸天无限", "轻小说"
+    ]},
+    { key: "world", name: "题材 / 世界观", items: [
+      "灵气复苏", "末日求生", "克苏鲁", "赛博朋克", "第四天灾", "规则怪谈", "天灾", "国运", "断层", "洪荒",
+      "诸天万界", "无限流", "星际", "古代", "架空", "开局", "直播", "外卖", "海岛", "鉴宝", "盗墓", "推理",
+      "美食", "宠物", "娱乐圈", "职场", "仕途", "三国", "大唐", "明朝", "宋朝", "清朝", "火影", "综漫", "二次元"
+    ]},
+    { key: "hero", name: "主角 / 金手指", items: [
+      "系统", "签到", "模拟器", "重生", "穿越", "无敌流", "扮猪吃虎", "苟道", "废柴逆袭", "天才流",
+      "幕后黑手", "反派主角", "赘婿", "奶爸", "独狼", "群像"
+    ]},
+    { key: "plot", name: "情节 / 节奏", items: [
+      "升级流", "打脸", "退婚流", "宗门争斗", "家族崛起", "争霸", "种田", "基建", "探险", "副本",
+      "时空循环", "救世", "黑暗", "热血", "轻松搞笑", "虐心", "第一人称"
+    ]}
+  ],
+  "女频": [
+    { key: "main", name: "主分类", single: true, items: [
+      "古风世情", "古言脑洞", "宫斗宅斗", "仙侠奇缘", "玄幻言情", "现言脑洞", "现代言情", "青春甜宠",
+      "青春校园", "豪门总裁", "婚恋生活", "职场婚恋", "民国言情", "年代", "种田", "快穿", "双男主",
+      "双女主", "纯爱", "星光璀璨", "女频悬疑", "女频衍生", "游戏体育", "轻小说"
+    ]},
+    { key: "world", name: "题材 / 世界观", items: [
+      "重生", "穿越", "空间", "系统", "团宠", "马甲", "玄学", "灵异", "无限流", "悬疑恋爱", "娱乐圈",
+      "豪门", "经商", "宫斗", "宅斗", "年代", "下乡", "校园", "职场", "医女", "美食", "萌宝", "宠物"
+    ]},
+    { key: "hero", name: "主角设定", items: [
+      "女强", "娇妻", "白月光", "替身", "真假千金", "马甲大佬", "学霸", "影后", "军嫂", "医妃",
+      "农女", "孤女"
+    ]},
+    { key: "plot", name: "情节 / 节奏", items: [
+      "甜宠", "虐恋", "破镜重圆", "先婚后爱", "追妻火葬场", "闪婚", "暗恋", "青梅竹马", "带球跑",
+      "契约婚姻", "复仇", "逆袭", "养娃", "群像", "第一人称"
+    ]}
+  ]
 };
-// 分类下拉填充
-function populateGenreSelects(audience) {
-  const data = GENRE_DATA[audience] || GENRE_DATA["男频"];
-  const genreSel = $("#p-genre");
-  const themeSel = $("#p-theme");
-  genreSel.innerHTML = '<option value="">-- 选择主分类 --</option>';
-  themeSel.innerHTML = '<option value="">-- 选择主题 --</option>';
-  data["主分类"].forEach(g => {
-    genreSel.innerHTML += '<option value="' + g + '">' + g + '</option>';
+
+/** 题材选择状态: main 单选, tags 多选 (含自定义) */
+const genrePick = { main: "", tags: new Set() };
+
+/** 把选中的题材拼成落库字符串 —— 和后端 createProject 的 genre 字段一一对应 */
+function genreValue() {
+  return [genrePick.main, ...genrePick.tags].filter(Boolean).join(" / ");
+}
+
+function renderGenrePicker() {
+  const groups = GENRE_LIB[selectedAudience] || GENRE_LIB["男频"];
+  const body = $("#gp-body");
+  if (!body) return;
+  body.innerHTML = groups.map((g) => `
+    <div class="gp-group">
+      <div class="gp-gname">${g.name}${g.single ? "<i>单选</i>" : ""}</div>
+      <div class="gp-chips">${g.items.map((it) => {
+        const on = g.single ? genrePick.main === it : genrePick.tags.has(it);
+        return `<button type="button" class="gp-chip${on ? " on" : ""}" data-g="${g.key}" data-v="${esc(it)}">${esc(it)}</button>`;
+      }).join("")}</div>
+    </div>`).join("");
+
+  body.querySelectorAll(".gp-chip").forEach((el) => {
+    el.onclick = () => {
+      const g = groups.find((x) => x.key === el.dataset.g);
+      const v = el.dataset.v;
+      if (!g) return;
+      if (g.single) genrePick.main = genrePick.main === v ? "" : v;
+      else if (genrePick.tags.has(v)) genrePick.tags.delete(v);
+      else genrePick.tags.add(v);
+      renderGenrePicker();
+    };
   });
-  data["主题"].forEach(t => {
-    themeSel.innerHTML += '<option value="' + t + '">' + t + '</option>';
+  renderPickedGenres();
+}
+
+/** 已选摘要: 主分类在前(深色), 标签在后(浅色), 点 × 取消 */
+function renderPickedGenres() {
+  const box = $("#gp-picked");
+  if (!box) return;
+  const all = [genrePick.main, ...genrePick.tags].filter(Boolean);
+  box.innerHTML = all.length
+    ? all.map((v) => `<span class="gp-tag${v === genrePick.main ? " core" : ""}" data-v="${esc(v)}" title="点击移除">${esc(v)}<i>×</i></span>`).join("")
+    : `<span class="gp-picked-empty">还没选 —— 下面点几个，或直接写一个</span>`;
+  box.querySelectorAll(".gp-tag").forEach((el) => {
+    el.onclick = () => {
+      const v = el.dataset.v;
+      if (genrePick.main === v) genrePick.main = "";
+      else genrePick.tags.delete(v);
+      renderGenrePicker();
+    };
   });
+}
+
+/** 加一个自定义题材 (去重; 顺手去掉用户手打的前后分隔符) */
+function addCustomGenre(raw) {
+  const v = String(raw || "").trim().replace(/^[\/、,，\s]+|[\/、,，\s]+$/g, "");
+  const input = $("#gp-custom");
+  if (!v) return;
+  if (genrePick.main === v || genrePick.tags.has(v)) { if (input) input.value = ""; return; }
+  genrePick.tags.add(v);
+  if (input) input.value = "";
+  renderGenrePicker();
+}
+
+function resetGenrePicker() {
+  genrePick.main = "";
+  genrePick.tags.clear();
+  const input = $("#gp-custom");
+  if (input) input.value = "";
+  renderGenrePicker();
 }
 
 // 工具名 → 中文标签
@@ -636,77 +714,182 @@ function refreshStatus() {
 }
 
 // ---------- 项目 ----------
+/** 相对时间: 列表右侧那一列 ("刚刚 / 3分钟 / 2小时 / 1天") */
+function relTime(sec) {
+  if (!sec) return "";
+  const d = Date.now() / 1000 - sec;
+  if (d < 60) return "刚刚";
+  if (d < 3600) return `${Math.floor(d / 60)}分钟`;
+  if (d < 86400) return `${Math.floor(d / 3600)}小时`;
+  if (d < 86400 * 30) return `${Math.floor(d / 86400)}天`;
+  if (d < 86400 * 365) return `${Math.floor(d / 86400 / 30)}个月`;
+  return `${Math.floor(d / 86400 / 365)}年`;
+}
+
+/** 字数缩写: 12345 → "1.2万字" */
+function fmtWords(n) {
+  if (!n) return "";
+  return n >= 10000 ? (n / 10000).toFixed(1).replace(/\.0$/, "") + "万字" : n + "字";
+}
+
+/** 项目搜索关键词 (由 #proj-search-input 驱动) */
+let projFilter = "";
+
 async function loadProjects() {
   const list = await api("/api/projects");
-  const menu = $("#proj-menu");
-  menu.innerHTML = `<button class="proj-opt" id="new-project-opt">+ 新建项目…</button>` +
-    list.map((p) => `<div class="proj-opt-row" data-id="${p.id}">
-        <button class="proj-opt" data-id="${p.id}"><span class="name">${esc(p.name)}</span><span class="meta">${esc(p.genre || "")}</span></button>
-        <button class="proj-del" data-del="${p.id}" title="删除项目">✕</button>
-      </div>`).join("");
-  $$("#proj-menu .proj-opt").forEach((el) => {
-    if (el.id === "new-project-opt") {
-      el.onclick = () => $("#proj-modal").classList.add("show");
-    } else {
-      el.onclick = () => { selectProject(el.dataset.id); closeSidebar(); };
-    }
-  });
-  // 删除项目
-  $$("#proj-menu .proj-del").forEach((el) => {
-    el.onclick = async (ev) => {
-      ev.stopPropagation();
-      const pidDel = el.dataset.del;
-      const name = list.find((p) => p.id === pidDel)?.name || pidDel;
-      if (!confirm(`确定删除项目「${name}」? 该项目下的章节/设定/消息将全部删除, 不可恢复!`)) return;
-      try {
-        await api(`/api/projects/${pidDel}`, { method: "DELETE" });
-        if (localStorage.getItem("tianyan_last_project") === pidDel) {
-          localStorage.removeItem("tianyan_last_project");
-        }
-        if (currentProject && currentProject.id === pidDel) {
-          currentProject = null;
-          $("#proj-info").textContent = "未选择项目";
-          $("#proj-select-label").textContent = "选择项目 ▾";
-          $("#tree").innerHTML = `<div class="tree-empty"><div class="tree-empty-icon">📂</div><p>选择或新建一个项目</p><p class="muted">章节、设定、素材将在此以文件树形式展示</p></div>`;
-          $("#chat").innerHTML = "";
-          showEmpty();
-        }
-        await loadProjects();
-        toast(`已彻底删除项目「${name}」(含章节/设定/消息/记忆), 数据库已压缩`, "ok", 5000);
-      } catch (e) {
-        toast("删除失败: " + e.message, "err");
-      }
+
+  const cnt = $("#proj-count");
+  if (cnt) cnt.textContent = String(list.length);
+
+  // 常驻项目列表: 所有项目始终可见 (旧版只有下拉, 新建一个之后旧项目就"看不见"了, 像被覆盖)
+  const plist = $("#proj-list");
+  if (!plist) return;
+
+  const kw = projFilter.trim().toLowerCase();
+  const shown = kw
+    ? list.filter((p) => (p.name || "").toLowerCase().includes(kw) || (p.genre || "").toLowerCase().includes(kw))
+    : list;
+
+  if (!list.length) {
+    plist.innerHTML = `<div class="proj-list-empty">还没有项目<br>点上方 ＋ 新建一个</div>`;
+    return;
+  }
+  if (!shown.length) {
+    plist.innerHTML = `<div class="proj-list-empty">没有匹配「${esc(projFilter)}」的项目</div>`;
+    return;
+  }
+
+  plist.innerHTML = shown.map((p) => {
+    const active = currentProject && currentProject.id === p.id;
+    const sub = [p.genre || "", p.chapterCount ? `${p.chapterCount} 章` : "", fmtWords(p.wordCount)]
+      .filter(Boolean).join(" · ") || "空项目";
+    return `<div class="proj-item${active ? " active" : ""}" data-id="${p.id}" title="${esc(p.name)}">
+        <span class="pbadge">${esc((p.name || "?").trim().slice(0, 1))}</span>
+        <span class="pbody">
+          <span class="pname">${esc(p.name)}</span>
+          <span class="psub">${esc(sub)}</span>
+        </span>
+        <span class="pmeta">${relTime(p.updatedAt)}</span>
+        <button class="pdel" data-del="${p.id}" title="删除项目">✕</button>
+      </div>`;
+  }).join("");
+
+  $$("#proj-list .proj-item").forEach((el) => {
+    el.onclick = (ev) => {
+      if (ev.target.closest(".pdel")) return;
+      if (currentProject && currentProject.id === el.dataset.id) return; // 已选中, 不重复加载
+      selectProject(el.dataset.id);
+      closeSidebar(); // 移动端选中后收起侧栏
     };
   });
-  // 当前项目标签
-  if (currentProject) {
-    $("#proj-select-label").textContent = currentProject.name;
-  } else if (list.length) {
-    $("#proj-select-label").textContent = "选择项目 ▾";
+  $$("#proj-list .pdel").forEach((el) => {
+    el.onclick = (ev) => { ev.stopPropagation(); removeProject(el.dataset.del, list); };
+  });
+}
+
+/** 删除项目 (列表和下拉共用一份逻辑) */
+async function removeProject(pidDel, list) {
+  const name = (list || []).find((p) => p.id === pidDel)?.name || pidDel;
+  if (!confirm(`确定删除项目「${name}」? 该项目下的章节/设定/消息将全部删除, 不可恢复!`)) return;
+  try {
+    await api(`/api/projects/${pidDel}`, { method: "DELETE" });
+    if (localStorage.getItem("tianyan_last_project") === pidDel) {
+      localStorage.removeItem("tianyan_last_project");
+    }
+    if (currentProject && currentProject.id === pidDel) {
+      currentProject = null;
+      $("#proj-info").textContent = "未选择项目";
+      $("#tree").innerHTML = `<div class="tree-empty"><div class="tree-empty-icon">📂</div><p>选择或新建一个项目</p><p class="muted">章节、设定、素材将在此以文件树形式展示</p></div>`;
+      $("#chat").innerHTML = "";
+      showEmpty();
+    }
+    await loadProjects();
+    toast(`已彻底删除项目「${name}」(含章节/设定/消息/记忆), 数据库已压缩`, "ok", 5000);
+  } catch (e) {
+    toast("删除失败: " + e.message, "err");
   }
 }
 
-// 项目选择器下拉
-$("#proj-select-btn").addEventListener("click", (e) => {
-  e.stopPropagation();
-  $("#proj-select-btn").parentElement.classList.toggle("open");
+// 项目区: 搜索框开关 / 新建项目
+$("#proj-search-btn").addEventListener("click", () => {
+  const box = $("#proj-search");
+  const btn = $("#proj-search-btn");
+  if (box.hasAttribute("hidden")) {
+    box.removeAttribute("hidden");
+    btn.classList.add("on");
+    $("#proj-search-input").focus();
+  } else {
+    box.setAttribute("hidden", "");
+    btn.classList.remove("on");
+    $("#proj-search-input").value = "";
+    projFilter = "";
+    loadProjects();
+  }
+});
+$("#proj-search-input").addEventListener("input", (e) => {
+  projFilter = e.target.value;
+  loadProjects();
 });
 // 加号按钮: 直接打开新建项目弹窗
-$("#proj-new-btn").addEventListener("click", (e) => {
-  e.stopPropagation();
-  $("#proj-select-btn").parentElement.classList.remove("open");
+$("#proj-new-btn").addEventListener("click", () => openProjectModal());
+
+/** 打开新建项目弹窗 —— 每次打开都重置题材选择, 别把上次选剩的带进来 */
+/** 弹窗模式: create 新建 / edit 编辑 (同一个弹窗两种用法, 题材选择器只有一套 DOM, 不复用就得复制一份) */
+let projModalMode = "create";
+let editingPid = null;
+
+/**
+ * 打开项目弹窗
+ * @param {object} [proj] 传了就是编辑模式, 不传是新建
+ */
+function openProjectModal(proj) {
+  projModalMode = proj ? "edit" : "create";
+  editingPid = proj ? proj.id : null;
+  $("#proj-modal-title").textContent = proj ? "编辑项目" : "新建小说项目";
+  $("#proj-ok").textContent = proj ? "保存" : "创建";
+
+  $("#p-name").value = proj ? proj.name || "" : "";
+  $("#p-style").value = proj ? proj.style || "" : "";
+  $("#p-premise").value = proj ? proj.premise || "" : "";
+
+  const aud = proj && proj.audience === "女频" ? "女频" : "男频";
+  selectedAudience = aud;
+  document.querySelectorAll("#p-audience .aud-btn").forEach((b) => {
+    b.classList.toggle("active", b.dataset.val === aud);
+  });
+
+  resetGenrePicker();
+  if (proj && proj.genre) setGenreFromString(proj.genre);
+
   $("#proj-modal").classList.add("show");
-});
-document.addEventListener("click", () => {
-  $("#proj-select-btn")?.parentElement.classList.remove("open");
-});
+  setTimeout(() => $("#p-name") && $("#p-name").focus(), 60);
+}
+
+/** 编辑当前项目 (文件树「项目设置」那一行) */
+function openProjectEdit() {
+  if (!currentProject) return toast("先选择项目", "warn");
+  openProjectModal(currentProject);
+}
+
+/** 把落库的 genre 字符串回填到选择器: 命中主分类库的当 main, 其余进 tags */
+function setGenreFromString(str) {
+  const lib = GENRE_LIB[selectedAudience] || GENRE_LIB["男频"];
+  const mainGroup = lib.find((g) => g.single);
+  const parts = String(str || "").split(/[\/、,，]/).map((s) => s.trim()).filter(Boolean);
+  genrePick.main = "";
+  genrePick.tags.clear();
+  for (const p of parts) {
+    if (!genrePick.main && mainGroup && mainGroup.items.includes(p)) genrePick.main = p;
+    else genrePick.tags.add(p);
+  }
+  renderGenrePicker();
+}
 
 async function selectProject(pid) {
   const p = await api(`/api/projects/${pid}`);
   currentProject = p;
   localStorage.setItem("tianyan_last_project", pid);
   $("#proj-info").textContent = p.name + (p.audience ? ` · ${p.audience}` : "") + (p.genre ? ` · ${p.genre}` : "");
-  $("#proj-select-label").textContent = p.name;
   // 拉取已上传素材
   let sources = [];
   try { sources = await api(`/api/projects/${pid}/sources`); } catch { sources = []; }
@@ -799,7 +982,7 @@ function renderTree() {
 
   const parts = [];
   // 项目信息节点
-  parts.push(`<div class="tree-file" data-act="info">
+  parts.push(`<div class="tree-file" data-act="info" title="点击编辑项目信息">
     <span class="ico">⚙️</span><span class="name">项目设置</span>
     <span class="meta">${p.audience ? p.audience + " · " : ""}${p.genre || ""}</span></div>`);
 
@@ -900,6 +1083,10 @@ function renderTree() {
   tree.querySelectorAll("[data-chapter]").forEach((el) => {
     el.addEventListener("click", () => openChapter(el.dataset.chapter));
   });
+  // 项目设置 → 编辑项目 (名称/题材/文风/核心设定)
+  tree.querySelectorAll('[data-act="info"]').forEach((el) => {
+    el.addEventListener("click", () => openProjectEdit());
+  });
   // 设定点击 → 打开抽屉预览
   tree.querySelectorAll("[data-element]").forEach((el) => {
     el.addEventListener("click", () => openElement(el.dataset.element));
@@ -945,13 +1132,16 @@ async function openSource(source) {
   $("#drawer").classList.add("open");
   $("#drawer-edit-area").classList.add("hidden");
   $("#drawer-body").classList.remove("hidden");
-  // 复用 search 拿片段
+  // 直接取素材全文 (以前复用 /search 且字段对不上, 打开永远"(无内容)")
   try {
-    const r = await api(`/api/projects/${currentProject.id}/search?q=${encodeURIComponent(source.slice(0, 8))}`);
-    const snips = (r.results || []).map((x) => esc(x.text)).join("\n\n---\n\n");
-    $("#drawer-body").innerHTML = `<h3>📚 ${esc(source)}</h3>${snips || "<p class='muted'>(无内容)</p>"}`;
-  } catch {
-    $("#drawer-body").innerHTML = `<p class="err">读取失败</p>`;
+    const r = await api(`/api/projects/${currentProject.id}/sources/${encodeURIComponent(source)}`);
+    if (r.error) throw new Error(r.error);
+    const head = String(r.text || "").slice(0, 30000);
+    $("#drawer-body").innerHTML =
+      `<h3>📚 ${esc(source)}</h3><p class="muted">${r.chars} 字${r.chars > 30000 ? " (仅预览前 3 万字, 模型可读全文)" : ""}</p>` +
+      `<pre style="white-space:pre-wrap;word-break:break-word;font:inherit;line-height:1.8;margin:0">${esc(head)}</pre>`;
+  } catch (err) {
+    $("#drawer-body").innerHTML = `<p class="err">读取失败: ${esc(err.message || String(err))}</p>`;
   }
 }
 
@@ -1218,7 +1408,7 @@ function showEmpty() {
   div.className = "empty";
   div.id = "empty-state";
   div.innerHTML = `<div class="empty-icon">✦</div><h2>天衍</h2>
-    <p>类似 Codex 的协作式小说写作助手。它会自主规划并调用工具完成创作。</p>`;
+    <p>天衍，群星旗下的多agent小说创作 协作式小说写作助手。它会自主规划并调用工具完成协作。</p>`;
   $("#chat").appendChild(div);
   rebuildSuggestions();
 }
@@ -1470,7 +1660,7 @@ async function onStopBtnClick() {
   return ok;
 }
 
-async function send(text) {
+async function send(text, chapterCount) {
   if (!currentProject) {
     toast("请先创建或选择一个项目", "warn");
     return;
@@ -1516,7 +1706,12 @@ async function send(text) {
         "Content-Type": "application/json",
         "Accept": "text/event-stream",
       },
-      body: JSON.stringify({ input: text, agent: "orchestrator" }),
+      body: JSON.stringify({
+        input: text,
+        agent: "orchestrator",
+        // 只有连续写作时才带, 1 章走默认路径不额外传参
+        ...(chapterCount && chapterCount > 1 ? { chapterCount } : {}),
+      }),
       // keepalive 让长连接更稳定 (沙箱预览环境下减少被中断概率)
       keepalive: true,
       // 兜底: 后端取消 8s 没响应时前端硬断 (见 onStopBtnClick)
@@ -2673,6 +2868,21 @@ function handleEvent(evt, assistant) {
       if (evt.tool === "rate_limit" || evt.tool === "quota_exhausted") {
         break;
       }
+      // 上下文自动压缩: 不是工具调用, 不建胶囊 —— 在思考面板里留一行记录, 让用户知道
+      // "早期对话被压成摘要了" (否则模型突然忘了前面, 用户会以为是模型变傻)
+      if (evt.tool === "context_compacted") {
+        ensureOrchestratorThinkPanel(assistant);
+        const cBody = getThinkBody(assistant, evt.agent || "orchestrator");
+        if (cBody) {
+          const cd = document.createElement("div");
+          cd.className = "st-entry st-delegate";
+          cd.innerHTML = `<span class="st-delegate-tag">📦 上下文压缩 <span class="st-delegate-done-mark">✓</span></span>
+            <div class="st-delegate-task">${esc(String(evt.result || ""))}</div>`;
+          cBody.appendChild(cd);
+        }
+        scrollChat();
+        break;
+      }
       const ag = evt.agent || "";
       const _obTool = evt.tool || "";
       // 与 step 对齐: delegate_to_agent/(完成) 不建胶囊, observation 也必须跳过 —
@@ -2949,7 +3159,19 @@ function handleEvent(evt, assistant) {
       hideThinkPanel();
       break;
     }
+    case "project_created": {
+      // 聊天里说"写一本…"创建了新项目: 立刻刷新左侧项目列表, 本轮结束后再切过去
+      pendingSwitchPid = evt.id;
+      loadProjects();
+      break;
+    }
     case "done": {
+      // 聊天里刚建的新项目: 本轮收尾后切过去 (用户才能接着在新项目里说话)
+      if (pendingSwitchPid) {
+        const _newPid = pendingSwitchPid;
+        pendingSwitchPid = null;
+        setTimeout(() => { selectProject(_newPid).catch(() => {}); }, 500);
+      }
       // 轮次结束: 兜底刷新一次项目数据 —— 防的是"白名单漏了某个工具/工具在子 agent 里跑完没走
       // observation 分支"这类情况。有这层兜底, 就不需要用户手动刷新页面才能看到产出。
       scheduleProjectRefresh();
@@ -3264,20 +3486,42 @@ $("#new-chapter-btn").addEventListener("click", async () => {
 // ---------- 上传 (toast) ----------
 $("#upload-btn").addEventListener("click", () => $("#upload-input").click());
 $("#upload-input").addEventListener("change", async (e) => {
-  const file = e.target.files[0];
-  if (!file || !currentProject) return;
+  const files = Array.from(e.target.files || []);
+  if (!files.length || !currentProject) return;
   const fd = new FormData();
-  fd.append("file", file);
-  toast(`正在导入 ${file.name}…`, "ok", 1500);
-  const res = await fetch(`/api/projects/${currentProject.id}/upload`, {
-    method: "POST",
-    body: fd,
-  });
-  const data = await res.json();
+  // 字段名必须跟后端一致 (后端两种都收, 这里用复数以支持多选)
+  files.forEach((f) => fd.append("files", f));
+  toast(files.length > 1 ? `正在导入 ${files.length} 个文件…` : `正在导入 ${files[0].name}…`, "ok", 2000);
+  let data = {};
+  try {
+    const res = await fetch(`/api/projects/${currentProject.id}/upload`, { method: "POST", body: fd });
+    data = await res.json();
+  } catch (err) {
+    toast(`上传失败: ${err.message || err}`, "err", 5000);
+    e.target.value = "";
+    return;
+  }
   if (data.error) {
-    toast(data.error, "err", 5000);
+    toast(data.error, "err", 6000);
   } else {
-    toast(`已导入 ${data.source}: ${data.chunks} 块 / ${data.chars} 字`, "ok", 4000);
+    const okList = data.files || [];
+    const total = okList.reduce((n, f) => n + (f.chars || 0), 0);
+    toast(`已导入 ${okList.length} 个素材: ${okList.map((f) => `${f.source} ${f.chunks}块`).join(", ")} (共 ${total} 字)`, "ok", 5000);
+    // 素材库要立刻出现在左侧文件树里, 否则用户会以为没传上
+    if (currentProject) {
+      const p = await api(`/api/projects/${currentProject.id}`);
+      if (p && !p.error) { currentProject = p; renderTree(); }
+    }
+    // 提示模型已经能读到: 把文件名塞进输入框, 用户直接补一句指令就能发
+    const input = $("#input");
+    if (input && !input.value.trim()) {
+      input.value = `我刚上传了素材《${okList[0].source}》, 先读一遍, 然后`;
+      input.dispatchEvent(new Event("input"));
+      input.focus();
+    }
+  }
+  if (data.errors && data.errors.length) {
+    toast(data.errors.map((x) => `${x.name}: ${x.error}`).join(" / "), "err", 8000);
   }
   e.target.value = "";
 });
@@ -3318,30 +3562,52 @@ $("#export-menu").addEventListener("click", (e) => {
 let selectedAudience = "男频";
 document.querySelectorAll("#p-audience .aud-btn").forEach(btn => {
   btn.addEventListener("click", () => {
+    const prev = genreValue();   // 先把已选的存下来, 切频道后按新库重新归类
     document.querySelectorAll("#p-audience .aud-btn").forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
     selectedAudience = btn.dataset.val;
-    populateGenreSelects(selectedAudience);
+    // 男女频题材库不同: 新库里没有的主分类会降级成标签, 但不会把用户的选择整个清掉
+    resetGenrePicker();
+    if (prev) setGenreFromString(prev);
   });
 });
-// 初始化分类下拉
-populateGenreSelects(selectedAudience);
+// 初始化题材选择器
+renderGenrePicker();
+
+// 自定义题材: 回车或点「添加」
+$("#gp-custom").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); addCustomGenre(e.target.value); }
+});
+$("#gp-custom-add").addEventListener("click", () => addCustomGenre($("#gp-custom").value));
 
 $("#proj-cancel").addEventListener("click", () => $("#proj-modal").classList.remove("show"));
 $("#proj-ok").addEventListener("click", async () => {
-  const genreVal = $("#p-genre").value;
-  const themeVal = $("#p-theme").value;
   const body = {
     name: $("#p-name").value.trim(),
-    genre: [genreVal, themeVal].filter(Boolean).join(" / "),
+    genre: genreValue(),
     style: $("#p-style").value.trim(),
     premise: $("#p-premise").value.trim(),
     audience: selectedAudience,
   };
   if (!body.name) return toast("请填名称", "warn");
+  if (!body.genre) return toast("至少选一个题材（或自己写一个）", "warn");
+
+  // 编辑模式: PUT 更新已有项目; 新建: POST
+  if (projModalMode === "edit" && editingPid) {
+    const pid = editingPid;
+    await api(`/api/projects/${pid}`, { method: "PUT", body: JSON.stringify(body) });
+    $("#proj-modal").classList.remove("show");
+    projModalMode = "create";
+    editingPid = null;
+    await selectProject(pid);   // 重新拉详情, 顺带刷新文件树和侧栏副标题
+    toast("项目已更新", "ok");
+    return;
+  }
+
   const p = await api("/api/projects", { method: "POST", body: JSON.stringify(body) });
   $("#proj-modal").classList.remove("show");
-  ["p-name", "p-genre", "p-theme", "p-style", "p-premise"].forEach((i) => ($("#" + i).value = ""));
+  ["p-name", "p-style", "p-premise"].forEach((i) => ($("#" + i).value = ""));
+  resetGenrePicker();
   await loadProjects();
   await selectProject(p.id);
   closeSidebar();
@@ -3713,8 +3979,11 @@ $("#ap-close").addEventListener("click", () => $("#agent-panel").classList.remov
 
 // ==================== 命令面板 (⌘K / Ctrl+K) ====================
 const CMDK_ITEMS = [
-  { id: "new-project", icon: "📁", label: "新建项目", action: () => $("#proj-modal").classList.add("show") },
-  { id: "switch-project", icon: "📂", label: "切换项目", action: () => $("#proj-select-btn").click() },
+  { id: "new-project", icon: "📁", label: "新建项目", action: () => openProjectModal() },
+  { id: "switch-project", icon: "📂", label: "搜索/切换项目", action: () => {
+      if ($("#proj-search").hasAttribute("hidden")) $("#proj-search-btn").click();
+      $("#proj-search-input").focus();
+    } },
   { id: "upload", icon: "📤", label: "上传素材", action: () => $("#upload-input").click() },
   { id: "export-txt", icon: "📄", label: "导出 TXT", action: () => doExport("txt") },
   { id: "export-docx", icon: "📘", label: "导出 Word", action: () => doExport("docx") },

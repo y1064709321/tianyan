@@ -16,6 +16,7 @@ import { randomBytes } from "node:crypto";
 import { browserSearch, browserFetch, browserScreenshot } from "../browser.js";
 import { assessArc, adjustArc, estimateDensity, recordSnapshot } from "../arc.js";
 import { buildWritingContext, summarizeChapter, updateCharacterStatesAfterChapter } from "../context/inject.js";
+import { readStyleSamples, harvestFromChapter } from "../styleLibrary.js";
 import { callScrapling } from "../scraplingClient.js";
 import { skeletonWriting, ruleQualityCheck, assessChapterRules, parseRankingItems, extractGenreDistribution, outlineSkeleton, weightedReviewScore, similarityCheck, detectAIHeuristic } from "../deterministic.js";
 import { buildAuditContext, auditDimensions, AUDIT_DIMENSIONS_TEXT, TOTAL_DIMENSIONS } from "./audit-dimensions.js";
@@ -58,6 +59,62 @@ function extractJsonPayload(text: string): Record<string, unknown> | null {
 // ===== 工具调度 =====
 // 将 Agent 的工具调用路由到具体实现
 // 完整的 36 个工具 (从 Python 版 tools.py 迁移)
+
+/** 单个平台的抓取结果 (scan_bestseller 内部流转用, 提到模块级供 summarizeScanDeterministically 复用) */
+export interface PlatResult {
+  platform: string;
+  ok: boolean;
+  note: string;
+  raw: { source: string; board: string; url: string; items: string[]; rawText: string } | null;
+  items: Array<{ rank: number; title: string; author: string; blurb: string }>;
+  genreDist: Record<string, number>;
+}
+
+/**
+ * 扫榜报告的**确定性归纳** —— LLM 不可用时顶上, 也是线上唯一不依赖模型的分析来源。
+ *
+ * 【为什么必须有真归纳, 不能抄书单】2026-10-18 实测踩坑: 旧兜底把原始书单又抄一遍
+ * 塞回「📝 市场趋势与创作建议」位, 于是报告**尾部**全是原始数据, 一点归纳都没有。
+ * 终审窗口扫到这里 → 判「产出实质为空, 缺失核心数据支撑」→ 打回 → 降级跑也救不回 →
+ * 用户看到"长任务跑了等于没跑"。数据从头到尾都是真的, 是兜底没提炼。
+ *
+ * 全部结论由代码从真实抓取结果算出: 抓取实况 / 各平台头部 / 多平台共热 / 单平台热点。
+ * 不调 LLM, 不编造书名 —— 书名只从 items 里取。
+ *
+ * 抽成纯函数是为了能直接单测 (不用伪造 LLM 失败)。
+ */
+export function summarizeScanDeterministically(results: PlatResult[], total: number): string {
+  const okPlats = results.filter((r) => r.ok);
+  const badPlats = results.filter((r) => !r.ok);
+  const out: string[] = [];
+  if (okPlats.length === 0) {
+    out.push(`所有平台均未抓到榜单数据 (${badPlats.map((r) => r.platform).join("、") || "无可用平台"}), 无从给出基于真实数据的趋势。请稍后重试, 或在指令里指定某个具体平台/榜单。`);
+    return out.join("\n");
+  }
+  out.push(`一、抓取实况: ${okPlats.length}/${results.length} 个平台成功, 共取回 ${total} 部作品。`);
+  if (badPlats.length > 0) out.push(`   未抓到: ${badPlats.map((r) => r.platform).join("、")} (风控/JS渲染/网络限制), 以下结论不含这些平台。`);
+  out.push(`二、各平台头部: ${okPlats.map((r) => `${r.platform}《${r.items[0]?.title || "—"}》`).join(" | ")}`);
+  // 跨平台共热 vs 单平台热点: genreDist 是 extractGenreDistribution 数出来的
+  // (标题+简介里题材关键词出现次数), 按"在几个平台出现过"分组, 完全来自真实数据。
+  const byGenre: Record<string, { plats: string[]; hits: number }> = {};
+  for (const r of okPlats) {
+    for (const [g, v] of Object.entries(r.genreDist)) {
+      if (v <= 0) continue;
+      const rec = (byGenre[g] = byGenre[g] || { plats: [], hits: 0 });
+      rec.plats.push(r.platform);
+      rec.hits += v;
+    }
+  }
+  const shared = Object.entries(byGenre).filter(([, r]) => r.plats.length >= 2).sort((a, b) => b[1].hits - a[1].hits).slice(0, 5);
+  const single = Object.entries(byGenre).filter(([, r]) => r.plats.length === 1).sort((a, b) => b[1].hits - a[1].hits).slice(0, 4);
+  if (shared.length > 0) {
+    out.push(`三、多平台共热: ${shared.map(([g, r]) => `${g}(${r.plats.length}/${okPlats.length} 平台)`).join(" | ")}`);
+    out.push(`   → 跨平台都在热 = 当前主流风向, 新书主线优先贴合, 对标样本从上表各平台头部里找。`);
+  }
+  if (single.length > 0) out.push(`四、单平台热点: ${single.map(([g, r]) => `${g}(${r.plats[0]})`).join(" | ")} —— 只在一家热, 可能是该平台用户偏好, 适合做差异化切口而非主线。`);
+  out.push(`五、创作建议: 主线贴合「多平台共热」题材, 用「单平台热点」找差异化切入; 上表书名/简介是本次真实抓到的全部素材, 不要凭印象补充未列出的作品 (抓到多少写多少, 写得少不是缺陷)。`);
+  return out.join("\n");
+}
 
 export async function dispatchTool(
   pid: string,
@@ -176,20 +233,37 @@ export async function dispatchTool(
         // 实测可达性: 番茄 JSON API ✅ / 起点·起点女生·晋江·书旗 ✅ (真实浏览器层) /
         // 飞卢·QQ阅读 ❌ (风控打不过); 都并行试, 抓到的进报告, 失败的诚实标注, 不静默丢
         const SCAN_ALL_PLATFORMS = ["起点中文网", "起点女生网", "番茄小说", "晋江文学城", "飞卢", "书旗", "QQ阅读"];
+        // 【平台名必须先归一化再去重】模型经常传简称 (「番茄」「起点」「晋江」), 这些不在 SCAN_ALL_PLATFORMS 里,
+        // 旧逻辑会当成"额外平台"前置 → 于是 "番茄" 和 "番茄小说" 同时存在于列表里,
+        // findPlatform 都命中同一份配置 → 同一平台被并发抓两遍, 请求量翻倍。
+        // 实测后果: 番茄详情页直接被限流(200 + 空 body), 两个条目一起报"抓取失败", 整榜数据全丢。
+        // 这里把每个名字归一到它真正命中的那份配置, 再按配置去重。
+        const canonicalPlatform = (name: string): string => {
+          const conf = findPlatform(name);
+          if (!conf) return name; // 未知平台: 保留原样 (抓取会失败并如实标注)
+          return SCAN_ALL_PLATFORMS.find((p) => findPlatform(p) === conf) || conf.match[0] || name;
+        };
         const platformOrder = (() => {
-          if (requestedPlatform && requestedPlatform !== "起点中文网" && !SCAN_ALL_PLATFORMS.includes(requestedPlatform)) {
-            return [requestedPlatform, ...SCAN_ALL_PLATFORMS];
-          }
-          if (requestedPlatform && SCAN_ALL_PLATFORMS.includes(requestedPlatform)) {
-            return [requestedPlatform, ...SCAN_ALL_PLATFORMS.filter((p) => p !== requestedPlatform)];
-          }
-          return SCAN_ALL_PLATFORMS;
+          const want = requestedPlatform ? canonicalPlatform(requestedPlatform) : "";
+          const rest = SCAN_ALL_PLATFORMS.filter((p) => p !== want);
+          const list = want ? [want, ...rest] : [...SCAN_ALL_PLATFORMS];
+          // 兜底去重: 同一份配置只留一个条目
+          const seen = new Set<unknown>();
+          return list.filter((p) => {
+            const conf = findPlatform(p) || p;
+            if (seen.has(conf)) return false;
+            seen.add(conf);
+            return true;
+          });
         })();
         // === 并行抓全部平台 (每个独立 try, 失败不拖垮整轮; 结果按 platformOrder 顺序排列) ===
-        type PlatResult = { platform: string; ok: boolean; note: string; raw: { source: string; board: string; url: string; items: string[]; rawText: string } | null; items: Array<{ rank: number; title: string; author: string; blurb: string }>; genreDist: Record<string, number> };
+        // PlatResult 定义在模块级 (summarizeScanDeterministically 复用)
+        // 番茄分类榜里「悬疑脑洞 / 科幻末世 / 游戏体育」男女频各有一个榜(category_id 相同、gender 不同,
+        // 返回的书完全不同), 必须带上本项目是男频还是女频, 否则女频项目会抓到男频书。
+        const scanAudience = store.getProject(pid)?.audience || "";
         const crawlOne = async (plat: string): Promise<PlatResult> => {
           try {
-            const c = await crawlRanking(plat, genre, board);
+            const c = await crawlRanking(plat, genre, board, scanAudience);
             const pi = parseRankingItems(c.rawText);
             const gd = extractGenreDistribution(pi);
             return { platform: plat, ok: pi.length > 0, note: pi.length > 0 ? "" : "该平台抓取失败 (反爬/JS渲染/网络限制)", raw: c, items: pi, genreDist: gd };
@@ -228,18 +302,16 @@ export async function dispatchTool(
           const timeoutPromise = new Promise<never>((_, rej) => setTimeout(() => rej(new Error("LLM timeout " + llmTimeoutMs + "ms")), llmTimeoutMs));
           resp = await Promise.race([llmPromise, timeoutPromise]);
         } catch (e) {
-          // LLM 超时/失败 → 用确定性数据生成 fallback 分析 (不编造, 只汇报抓到的条目 + 题材分布)
+          // LLM 超时/失败 → 用确定性数据生成 fallback 分析。
+          //
+          // 【必须真的算出结论, 不能把原始书单抄一遍】2026-10-18 实测踩坑: 旧兜底把
+          // fallbackLines (又一遍书单) 塞回「📝 市场趋势与创作建议」位, 于是报告**尾部**
+          // 全是原始数据, 没有任何归纳。终审窗口扫到这里 → 判「产出实质为空, 缺失核心
+          // 数据支撑」→ 打回 → 降级跑也救不回来 → 用户看到任务跑了等于没跑。
+          // 数据从头到尾都是真的, 是兜底没有提炼。下面全部由代码从真实数据算出,
+          // 不调 LLM, 也不编造书名。
           logWarn("[扫榜] LLM 归纳超时/失败 (" + (e as Error).message?.slice(0, 60) + "), 用确定性数据生成 fallback 分析");
-          const fallbackLines: string[] = [];
-          if (allParsed.length > 0) {
-            fallbackLines.push(`【多平台榜单数据 (真抓 ${allParsed.length} 部, 时刻 ${fetchedAt})】`);
-            for (const r of allResults) {
-              if (r.ok) fallbackLines.push(`\n■ ${r.platform}:`);
-              for (const i of r.items.slice(0, 8)) fallbackLines.push(`  第${i.rank}名: ${i.title} | ${i.author} | ${i.blurb.slice(0, 60)}`);
-            }
-          }
-          fallbackLines.push("\n【LLM 归纳不可用 (网络/限流), 以下为确定性数据汇报】趋势: 以上为当前真实榜单快照, 创作建议请结合题材分布与上述书名判断。");
-          resp = { content: fallbackLines.join("\n") };
+          resp = { content: summarizeScanDeterministically(allResults, allParsed.length) };
         }
         // 生成人类可读多平台文本报告 (含抓取时刻 + 失败标注 — 让用户知道"这是哪天的、哪些平台没抓到")
         const lines: string[] = [];
@@ -247,7 +319,7 @@ export async function dispatchTool(
         lines.push("");
         for (const r of allResults) {
           if (r.ok) {
-            lines.push(`■ ${r.platform} [${r.raw?.source === "json-api" ? "JSON API" : r.raw?.source === "scrapling" ? "Scrapling 指纹抓取(反爬)" : r.raw?.source === "browser" ? "浏览器抓取" : "HTML 解析"}${r.raw?.url ? " · " + r.raw.url.slice(0, 50) : ""}]`);
+            lines.push(`■ ${r.platform} [${r.raw?.source === "platform-custom" ? "平台专属接口" : r.raw?.source === "json-api" ? "JSON API" : r.raw?.source === "scrapling" ? "Scrapling 指纹抓取(反爬)" : r.raw?.source === "browser" ? "浏览器抓取" : "HTML 解析"}${r.raw?.url ? " · " + r.raw.url.slice(0, 50) : ""}]`);
             for (const i of r.items.slice(0, 10)) {
               const t = `**《${i.title}》**`;
               const a = i.author ? ` (${i.author})` : "";
@@ -437,6 +509,27 @@ export async function dispatchTool(
         }
         if (outline) contextBlock += `【本章大纲】\n${outline}\n\n`;
 
+        // ===== 共享文笔样本 (跨书共用, 实时读取) =====
+        // 从样本库里按题材召回高分片段作为"文风参照", 只做模仿不做抄袭。
+        // 每次都直接查库(不缓存), 所以刚 harvest 进去的样本下一次写作就能用上。
+        try {
+          const samples = readStyleSamples({
+            genre: projCtx?.genre || "",
+            limit: 5,
+            perSampleChars: 400,
+            totalChars: 2000,
+          });
+          if (samples.length) {
+            const kinds: Record<string, string> = {
+              opening: "开篇", dialogue: "对话", action: "动作", description: "描写", ending: "收尾", other: "片段",
+            };
+            contextBlock +=
+              "【文风参照 (同类高分片段, 学句式和节奏, 严禁照抄原句)】\n" +
+              samples.map((s) => `〔${kinds[s.kind] || "片段"}·评分${s.rating}〕${s.text}`).join("\n---\n") +
+              "\n\n";
+          }
+        } catch { /* 样本库不可用不影响写作 */ }
+
         const s = getSettings();
         const genreLock3 = projCtx?.genre ? `\n【风格锁定】本项目类型为「${projCtx.genre}」, 全程禁止偏离。禁止出现其他类型的元素。` : "";
         let resp: { content: string } | null = null;
@@ -474,14 +567,29 @@ export async function dispatchTool(
         store.updateChapter(ch.id, { content: finalContent, status: "done" });
 
         // === 写后闭环: 生成章节摘要 (远历史滚动注入的源头) ===
-        // 非阻塞: 摘要生成失败不阻断写作流程, 回退确定性抽取
-        summarizeChapter(pid, ch.id, ch.idx, finalContent, chat).then((sum) => {
-          try { store.upsertChapterSummary(pid, ch.id, ch.idx, sum); } catch {}
-        }).catch(() => {});
+        // 【必须 await】之前是 fire-and-forget: 下一章立刻开写时, 本章摘要往往还没入库,
+        // 于是"前情提要"里看不到上一章 → 连续写几章就开始跑偏、前后矛盾。
+        // 失败仍不阻断写作流程 (回退确定性抽取/保留旧状态), 但要先把结果落库再进下一章。
+        try {
+          const sum = await summarizeChapter(pid, ch.id, ch.idx, finalContent, chat);
+          if (sum) store.upsertChapterSummary(pid, ch.id, ch.idx, sum);
+        } catch { /* 摘要失败不阻断 */ }
 
         // === 写后闭环: 更新角色当前状态 (防人物漂移) ===
-        // 非阻塞: LLM 失败保留旧状态, 不阻断写作流程
-        updateCharacterStatesAfterChapter(pid, ch.idx, finalContent, chat).catch(() => {});
+        try {
+          await updateCharacterStatesAfterChapter(pid, ch.idx, finalContent, chat);
+        } catch { /* 状态更新失败保留旧状态, 不阻断 */ }
+
+        // === 写后闭环: 采集文笔样本进共享库 ===
+        // 只抽有特征的段(对话密集/动作密集), 每章最多 2 条, 防止样本库被单章灌爆。
+        try {
+          harvestFromChapter({
+            content: finalContent,
+            genre: projCtx?.genre || "",
+            source: `${projCtx?.name || "未命名"} 第${ch.idx}章 ${ch.title}`,
+            maxPerChapter: 2,
+          });
+        } catch { /* 采集失败不影响写作 */ }
 
         return JSON.stringify({
           text: textOut,
@@ -535,6 +643,41 @@ export async function dispatchTool(
         }
         const id = store.upsertCharacterProfile(pid, cname, fields as Record<string, unknown>);
         return JSON.stringify({ id, name: cname, action });
+      }
+
+      // ===== 素材库 (用户上传的对标书/参考资料) =====
+      // 以前上传只落 chunks 表, 没有任何读取入口 → 模型"看不见附件"。这里给它一双手。
+      case "read_source": {
+        const sources = store.listSources(pid);
+        if (!sources.length) return JSON.stringify({ sources: [], hint: "素材库为空: 请让用户在输入框左侧的回形针按钮上传 txt/md/docx" });
+        const want = String(args.name || "").trim();
+        if (!want) {
+          return JSON.stringify({
+            sources: sources.map((x) => ({ name: x.source, chars: x.chars, chunks: x.chunks })),
+            hint: "读取某个素材请传 name, 长文用 offset/limit 翻页",
+          });
+        }
+        // 文件名容错: 用户/模型可能只说了书名的一部分 (带不带扩展名、带不带《》)
+        const bare = (t: string) => t.replace(/^《|》$/g, "").replace(/\.[^.]+$/, "").trim();
+        const hit = sources.find((x) => x.source === want)
+          || sources.find((x) => bare(x.source) === bare(want))
+          || sources.find((x) => x.source.includes(bare(want)) || bare(want).includes(bare(x.source)));
+        if (!hit) {
+          return JSON.stringify({ error: `没有找到素材「${want}」`, sources: sources.map((x) => x.source) });
+        }
+        const full = store.getSourceText(pid, hit.source);
+        const offset = Math.max(0, Number(args.offset) || 0);
+        const limit = Math.min(20000, Math.max(500, Number(args.limit) || 8000));
+        const slice = full.slice(offset, offset + limit);
+        return JSON.stringify({
+          source: hit.source,
+          total_chars: full.length,
+          offset,
+          returned_chars: slice.length,
+          has_more: offset + limit < full.length,
+          next_offset: offset + limit < full.length ? offset + limit : undefined,
+          text: slice,
+        });
       }
 
       // ===== 设定管理 =====
@@ -1234,7 +1377,7 @@ interface PlatformConfig {
    * 分类榜还是 PUA 字体混淆, 需要拿 bookId 二次抓详情页还原 —— 塞不进 url→JSON→list 这套通用流程。
    * 返回 null 表示"这个榜我不处理", 调用方会继续走通用流程。
    */
-  customFetch?: (board: string, genre: string) => Promise<{
+  customFetch?: (board: string, genre: string, audience?: string) => Promise<{
     items: string[];
     rawText: string;
     url: string;
@@ -1339,9 +1482,9 @@ const PLATFORMS: PlatformConfig[] = [
   // ---- 番茄小说 ----
   {
     match: ["番茄", "fanqie"],
-    // 【默认不再是"阅读榜"】/api/rank/list?way=N 是**假榜**: way=1..8 全部返回同一份都市赘婿综合榜,
-    // 没有任何题材区分度, 用户当场指出"这种的榜没啥作用"。默认改抓按题材分类的**分类榜**。
-    // 老的阅读榜/热度榜/新书榜保留在下面, 手动指定 board 仍能抓 (用户要求降级但不删除)。
+    // 【默认不再是"阅读榜"】/api/rank/list?way=N 是**假榜**: 2026-10-18 复测 way=1..5 返回的
+    // bookId 完全相同(7 本, 全是都市赘婿综合榜), 参数根本没生效。已彻底弃用, 不再挂 api 映射。
+    // 默认改抓按题材分类的**分类榜**(真实榜单, 按题材分 37 类)。
     defaultBoard: "分类榜",
     boards: {
       "分类榜": "https://fanqienovel.com/rank",
@@ -1352,14 +1495,10 @@ const PLATFORMS: PlatformConfig[] = [
       "热度榜": "https://fanqienovel.com/rank",
       "新书榜": "https://fanqienovel.com/rank",
     },
-    // 番茄 /rank 页是 JS 渲染壳页, 真实数据走 JSON API (已实测: /api/rank/list?way=1 返回 data.list[].bookName/author/abstract)
-    api: {
-      "阅读榜": "https://fanqienovel.com/api/rank/list?way=1",
-      "热度榜": "https://fanqienovel.com/api/rank/list?way=2",
-      "新书榜": "https://fanqienovel.com/api/rank/list?way=3",
-    },
-    // 三套榜 + 字体混淆还原, 全部在 src/agents/fanqie.ts
-    customFetch: async (board: string, genre: string) => {
+    // 三套榜 + 字体混淆还原, 全部在 src/agents/fanqie.ts。
+    // 这里**不再配 api**: way= 老接口是死榜, 配了就等于给 LLM 留一条"抓回赘婿榜"的暗路。
+    // 阅读榜/新书榜 是分类榜的别名 (官方页面就叫「男频阅读榜」「男频新书榜」), 走同一条分类链路。
+    customFetch: async (board: string, genre: string, audience?: string) => {
       const FQ_URL = "https://fanqienovel.com/";
       if (board === "金番作家榜") {
         const authors = await fanqie.fetchFanqieAuthorBoard();
@@ -1367,15 +1506,17 @@ const PLATFORMS: PlatformConfig[] = [
         const items = fanqie.formatFanqieBooks(authors, "番茄金番作家榜（殿堂作家 / 金番作家，按平台作家等级排序）");
         return { items, rawText: items.join("\n"), url: FQ_URL + "api/author/misc/top_author_list/v1/" };
       }
-      if (board === "巅峰榜") {
+      if (board === "巅峰榜" || board === "热度榜") {
         const tops = await fanqie.fetchFanqieTopBooks(30);
         if (tops.length === 0) return null;
-        const items = fanqie.formatFanqieBooks(tops, "番茄巅峰榜（按好评、人气、互动综合得分）");
+        const items = fanqie.formatFanqieBooks(tops, "番茄巅峰榜（根据作品好评、人气、互动等综合得分排行）");
         return { items, rawText: items.join("\n"), url: FQ_URL + "api/author/misc/top_book_list/v1/" };
       }
-      if (board === "分类榜" || board === "分类新书榜") {
-        const isNew = board === "分类新书榜";
-        const cat = fanqie.pickFanqieCategory(genre);
+      // 分类榜 / 阅读榜 → 阅读榜(rankMold=2); 分类新书榜 / 新书榜 → 新书榜(rankMold=1)
+      if (board === "分类榜" || board === "分类新书榜" || board === "阅读榜" || board === "新书榜") {
+        const isNew = board === "分类新书榜" || board === "新书榜";
+        // audience 决定同名分类(悬疑脑洞/科幻末世/游戏体育)抓男频还是女频
+        const cat = fanqie.pickFanqieCategory(genre, audience);
         // 番茄没有"武侠"大类, 也没有泛"言情" —— 映射不到就如实回退巅峰榜,
         // 绝不拿个不沾边的分类冒充 (历史上拿都市赘婿榜冒充仙侠榜被用户当场抓包)
         if (!cat) {
@@ -1387,19 +1528,22 @@ const PLATFORMS: PlatformConfig[] = [
           );
           return { items, rawText: items.join("\n"), url: FQ_URL + "api/author/misc/top_book_list/v1/" };
         }
-        const books = await fanqie.fetchFanqieCategoryBoard(cat, isNew ? 2 : 1);
+        const books = await fanqie.fetchFanqieCategoryBoard(
+          cat,
+          isNew ? fanqie.FQ_RANK_NEW : fanqie.FQ_RANK_READING,
+        );
         if (books.length === 0) return null;
         const items = fanqie.formatFanqieBooks(
           books,
-          `番茄${cat.name}·${isNew ? "新书" : "阅读"}榜（按在读数据排序，${isNew ? "30万字以下" : "30万字以上"}）`,
+          `番茄${cat.name}·${isNew ? "新书" : "阅读"}榜（按官方榜单顺序，在读人数取接口 read_count）`,
         );
         return {
           items,
           rawText: items.join("\n"),
-          url: `https://fanqienovel.com/api/rank/category/list?category_id=${cat.id}&gender=${cat.gender}&rankMold=${isNew ? 2 : 1}`,
+          url: `https://fanqienovel.com/api/rank/category/list?category_id=${cat.id}&gender=${cat.gender}&rankMold=${isNew ? fanqie.FQ_RANK_NEW : fanqie.FQ_RANK_READING}`,
         };
       }
-      return null; // 阅读榜/热度榜/新书榜走下方通用 api 流程
+      return null; // 未列出的榜名: 交回通用流程 (番茄已无 api 映射, 最终会落到 HTML/浏览器层)
     },
     extract: (text, board) => {
       const clean = text.replace(/\s+/g, " ");
@@ -1585,6 +1729,7 @@ async function crawlRanking(
   platform: string,
   genre: string,
   board: string,
+  audience?: string,
 ): Promise<{ source: string; board: string; url: string; items: string[]; rawText: string }> {
   const conf = findPlatform(platform) || PLATFORMS[0]!;
   const boardName = conf.boards[board] ? board : conf.defaultBoard;
@@ -1600,7 +1745,7 @@ async function crawlRanking(
   // 返回 null 表示该榜不由专属逻辑处理, 继续往下走通用 api / HTML 流程。
   if (conf.customFetch) {
     try {
-      const cr = await conf.customFetch(boardName, genre);
+      const cr = await conf.customFetch(boardName, genre, audience);
       if (cr && cr.items.length > 0) {
         logInfo(`[扫榜] ${platform} 平台专属抓取成功 (${cr.items.length} 条) 榜=${boardName} 题材=${genre} ${cr.url}`);
         return { source: "platform-custom", board: boardName, url: cr.url, items: cr.items, rawText: cr.rawText };
@@ -2085,13 +2230,37 @@ export async function enforceReviewAfterWrite(
  * 上下文只收结构化摘要 + 终审裁决准则, 保持终审判断不被长文/历史污染。
  * @returns { content: 交付内容(原稿, 打回时附裁决理由), approved, score, verdict }
  */
+/**
+ * 给终审看的摘要 —— 【必须头尾都留, 不能只截前面】。
+ *
+ * 踩坑 (2026-10-18 实测, 扫榜快路径): scan_bestseller 产出 5446 字,
+ * **前 1200 字全是原始书单** (`第1名: 《凡骨》… 第6名: 《青山》…`),
+ * 而「题材分布 / TOP10 核心卖点 / 市场风向 / 创作建议」全在**末尾**。
+ * 终审只 slice(0,1200) → 看不到任何分析 → 判「产出实质为空, 缺失核心数据支撑」→ 打回。
+ * 数据是真的, 结论也在, 纯粹是窗口把结论切掉了。
+ *
+ * 工具类报告的体例几乎都是「原始数据在前, 结论在后」, 所以头(证明数据真实)+
+ * 尾(给人看结论)各取一段, 中间省略。别再改回只截头部。
+ */
+export function reviewExcerpt(content: string, limit = 1200): string {
+  const s = content || "";
+  if (s.length <= limit) return s;
+  const head = Math.floor(limit * 0.5);
+  const tail = limit - head - 60; // 60 留给省略说明
+  return (
+    s.slice(0, head) +
+    `\n\n…… [中间省略 ${s.length - limit} 字原始数据, 以下是本报告的结论/建议部分] ……\n\n` +
+    s.slice(-tail)
+  );
+}
+
 export async function finalReviewDeliverable(
   pid: string, runId: string, expertAgent: AgentName, deliverableLabel: string,
   content: string, emit: (evt: SSEEvent) => void,
 ): Promise<{ content: string; approved: boolean; score: number; verdict: string }> {
   if (!(content || "").trim()) return { content, approved: true, score: 0, verdict: "产出为空, 跳过终审" };
   // 终审只看摘要 (上限 1200 字): 调用方传入的已是结构化摘要, 这里再兜一层截断防长文污染
-  const src = (content || "").slice(0, 1200);
+  const src = reviewExcerpt(content, 1200);
   let resp: { content: string; [k: string]: unknown } | null = null;
   try {
     resp = await Promise.race([
@@ -2167,6 +2336,113 @@ export async function finalReviewWithRework(
   return { content: review.approved ? review.content : content, approved: review.approved, score: review.score, verdict: review.verdict, reworked: rounds };
 }
 
+// ===== 设定落库保底 =====
+
+/**
+ * 把"已经跟用户敲定"的设定抽成结构化条目并直接落库 (设定集 = elements 表 + 角色档案表)。
+ *
+ * 为什么需要它: 角色师/架构师都是 LLM, 让它们"记得调 add_element"永远会漏 (2026-10-18 实测:
+ * 总编写了"全部归拢进设定集", 角色师回了一段漂亮的总结, elements 表 0 行, 侧边栏设定集空着)。
+ * 与扫榜/拆书一样, 落库这种事必须由代码层保证 —— 抽取用一次低温 LLM 调用, 写入走 dispatchTool,
+ * 走的是同一条权限/校验链路, 不绕过任何门禁。
+ *
+ * 幂等: 同名同 kind 已存在则跳过, 重复触发不会写出重复条目。
+ */
+async function ensureSettingsPersisted(
+  pid: string,
+  emit: (evt: SSEEvent) => void,
+  expertOutput: string,
+): Promise<{ added: number; profiles: number; summary: string }> {
+  const empty = { added: 0, profiles: 0, summary: "" };
+  const recent = store.listMessages(pid, 60)
+    .filter((m) => (m.role === "user" || m.role === "assistant") && !m.toolName && (m.content || "").trim().length >= 20)
+    .slice(-14);
+  if (!recent.length) return empty;
+  const convo = recent
+    .map((m) => `${m.role === "user" ? "用户" : "总编"}: ${m.content.slice(0, 900)}`)
+    .join("\n\n");
+  let raw = "";
+  try {
+    const resp = await Promise.race([
+      chat([
+        {
+          role: "system",
+          content: `你是「天衍」的角色师, 本轮只做一件事: 把对话里**已经敲定**的设定抽成结构化条目, 交给系统落库。
+只输出 JSON, 不要解释, 不要 markdown 代码块:
+{"characters":[{"name":"角色名","role":"主角/配角","personality":"性格+口头禅","background":"出身与动机"}],
+ "elements":[{"kind":"character|world|plot|style|foreshadow|location|timeline","name":"条目名","detail":"40-200字的具体内容"}]}
+规则:
+1) 只抽对话里真实出现过的设定, 没敲定的不要编;
+2) 力量体系 / 境界分层 / 金手指机制 / 世界规则 → kind="world"; 爽点与剧情结构 → "plot"; 文风 → "style";
+3) detail 要具体可执行 (带层级、数值、规则), 禁止"待定""略""视情况而定";
+4) elements 至少 3 条, 尽量把对话里每一条敲定的设定都拆成独立条目。`,
+        },
+        {
+          role: "user",
+          content: `【最近对话】\n${convo}\n\n${expertOutput.trim() ? `【本轮角色师产出】\n${expertOutput.slice(0, 2000)}\n\n` : ""}请输出 JSON。`,
+        },
+      ], undefined, { temperature: 0.2, maxTokens: 2000 }) as Promise<{ content?: string }>,
+      new Promise<{ content?: string }>((_, rej) => setTimeout(() => rej(new Error("设定抽取超时 45s")), 45_000)),
+    ]);
+    raw = (resp?.content || "").trim();
+  } catch (e) {
+    logWarn("[设定保底] 抽取调用失败: " + ((e as Error).message || "").slice(0, 120));
+    return empty;
+  }
+  const s = raw.indexOf("{");
+  const t = raw.lastIndexOf("}");
+  if (s < 0 || t <= s) {
+    logWarn("[设定保底] 抽取结果不是 JSON, 放弃本轮保底");
+    return empty;
+  }
+  let parsed: { characters?: Array<Record<string, unknown>>; elements?: Array<Record<string, unknown>> };
+  try {
+    parsed = JSON.parse(raw.slice(s, t + 1)) as typeof parsed;
+  } catch {
+    logWarn("[设定保底] JSON 解析失败, 放弃本轮保底");
+    return empty;
+  }
+
+  const existingEl = new Set(store.listElements(pid).map((e) => `${e.kind}:${e.name}`));
+  const existingPr = new Set(store.listCharacterProfiles(pid).map((p) => p.name));
+  let profiles = 0;
+  for (const c of parsed.characters || []) {
+    const name = String(c.name || "").trim();
+    if (!name || existingPr.has(name)) continue;
+    try {
+      await dispatchTool(pid, "manage_character", {
+        action: "add", name,
+        role: String(c.role || "配角"),
+        personality: String(c.personality || ""),
+        behaviorLogic: String(c.background || ""),
+      }, "character-designer");
+      existingPr.add(name);
+      profiles++;
+    } catch (e) {
+      logWarn("[设定保底] 角色档案写入失败 " + name + ": " + ((e as Error).message || "").slice(0, 80));
+    }
+  }
+  let added = 0;
+  for (const el of parsed.elements || []) {
+    const kind = String(el.kind || "world").trim() || "world";
+    const name = String(el.name || "").trim();
+    const detail = String(el.detail || "").trim();
+    if (!name || !detail || existingEl.has(`${kind}:${name}`)) continue;
+    try {
+      await dispatchTool(pid, "add_element", { kind, name, detail }, "character-designer");
+      existingEl.add(`${kind}:${name}`);
+      added++;
+    } catch (e) {
+      logWarn("[设定保底] 设定写入失败 " + name + ": " + ((e as Error).message || "").slice(0, 80));
+    }
+  }
+  if (!added && !profiles) return empty;
+  logInfo(`[设定保底] 角色师本轮未落库, 代码层从对话抽取并写入 ${added} 条设定 + ${profiles} 份角色档案`);
+  emit({ type: "observation", agent: "character-designer", tool: "add_element", result: `[设定保底] 专家本轮没有实际落库, 系统已从已敲定的对话里抽取并写入 ${added} 条设定 + ${profiles} 份角色档案 (侧边栏设定集已更新)` });
+  const summary = `【系统保底落库】角色师本轮没有真的调用 add_element, 为避免"说了不做", 系统直接从我们已敲定的对话里抽取并写入设定集: **${added} 条设定 + ${profiles} 份角色档案**。请到左侧「设定」里核对, 有偏差直接说改哪条。`;
+  return { added, profiles, summary };
+}
+
 // ===== Agent 循环 =====
 
 interface RunState {
@@ -2179,6 +2455,7 @@ interface RunState {
   emit: (evt: SSEEvent) => void;
   sharedSteps?: { value: number };
   orchestratorDelegated?: boolean;  // 阶段确认制: orchestrator 一次 run 只委派一次
+  toolCallsExecuted?: number;  // 本 run 真正执行过的工具数 (收尾闸门用: 0 工具 + 口头承诺 = 没干活)
   orchestratorDelegateCount?: number;  // orchestrator 本轮委派次数计数
   pendingDelegationReport?: boolean;  // 委派收尾轮标记: 总编刚拿到子agent结果, 下一轮必须产出面向用户的真实汇报正文 (不得把思考当正文)
   tokenAccumulator?: { value: number };  // 本次 run 的 token 累计 (流式 usage 事件累加, finishRun 前写回 DB)
@@ -2297,6 +2574,22 @@ const TOOL_SCHEMAS: Record<string, ToolDefinition> = {
     type: "function",
     function: { name: "add_element", description: "添加设定元素", parameters: { type: "object", properties: { kind: { type: "string" }, name: { type: "string" }, detail: { type: "string" } }, required: ["kind", "name"] } },
   },
+  read_source: {
+    type: "function",
+    function: {
+      name: "read_source",
+      description: "读取用户上传的素材/对标书 (素材库)。不传 name 时列出全部素材; 传 name 返回该素材正文, 长文用 offset/limit 分页读取",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "素材文件名 (不传=列出所有素材)" },
+          offset: { type: "number", description: "起始字符位置, 默认 0" },
+          limit: { type: "number", description: "本次读取字数, 默认 8000, 最大 20000" },
+        },
+        required: [],
+      },
+    },
+  },
   manage_world: {
     type: "function",
     function: { name: "manage_world", description: "管理世界观条目", parameters: { type: "object", properties: { action: { type: "string" }, name: { type: "string" }, category: { type: "string" }, description: { type: "string" } }, required: ["action", "name"] } },
@@ -2399,6 +2692,7 @@ function isReadonlyTool(toolName: string): boolean {
     "read_file", "list_files", "search_files", "web_search", "web_fetch",
     "query_characters", "query_world", "query_chapters", "quality_check",
     "list_authors", "list_elements", "bash",
+    "read_source",   // 只读素材库, 资料员/质检员也该能用
   ];
   return readonlyTools.includes(toolName);
 }
@@ -2481,6 +2775,10 @@ export async function runAgentLoop(state: RunState): Promise<string> {
   state.tokenAccumulator = tokenAccum;
   emit({ type: "model_picked", agent: agentName, tier: agentCfg?.modelTier || "mid", model: agentModel.model });
 
+  // 非流式回退拿到的工具调用: 交给下一轮直接执行, 不再重走一次流式
+  // (旧代码把它塞进本轮 nativeToolCalls 后又 continue 掉 → 工具永远不执行,
+  //  症状: 模型明明"选了 read_source", 结果什么都没发生)
+  let carryToolCalls: ToolCall[] = [];
   try {
   while (step < agentMaxSteps && round <= agentMaxTurns) {
     step++;
@@ -2510,6 +2808,13 @@ export async function runAgentLoop(state: RunState): Promise<string> {
     let thinkDone = false;
     let inThinking = false;
     let nativeToolCalls: ToolCall[] = [];
+    // 上一轮非流式回退已经拿到工具调用 → 本轮直接执行, 不再调 LLM (省一次调用, 也避免再空一次)
+    let skipLlmThisRound = false;
+    if (carryToolCalls.length) {
+      nativeToolCalls = carryToolCalls;
+      carryToolCalls = [];
+      skipLlmThisRound = true;
+    }
     let emptyToolCallFiltered = false; // 本轮是否有空参数 tool call 被过滤
     // Thinking缓冲区: 累积thinking内容, content到来时统一发送（过滤system prompt泄漏）
     let thinkBuffer = "";
@@ -2529,7 +2834,7 @@ export async function runAgentLoop(state: RunState): Promise<string> {
     // 只有降级轮才允许代码层旁路接管 (正则代跑核心工具), 正常轮一律让主 Agent 自己决策。
     let llmDegraded = false;
     let rateLimitRetried = false;  // 429 突发限流: 是否已做过 60s 冷却重试 (防无限空转)
-    for (let streamAttempt = 0; streamAttempt <= MAX_STREAM_RETRIES; streamAttempt++) {
+    for (let streamAttempt = 0; !skipLlmThisRound && streamAttempt <= MAX_STREAM_RETRIES; streamAttempt++) {
       if (streamAttempt > 0) {
         llmDegraded = true; // 本轮经历过重试 → 视为 LLM 降级轮
         // 429/限流已命中: 不再重试 (避免白烧额度), 直接跳出走兜底
@@ -2963,6 +3268,9 @@ export async function runAgentLoop(state: RunState): Promise<string> {
             if (subProfiles.length) ctxBlock += "\n\n【角色档案】\n" + subProfiles.map((p: any) => `- ${p.name}(${p.role || "?"}): ${p.personality || ""}`).join("\n");
             const subWorld = store.listWorldEntries(pid);
             if (subWorld.length) ctxBlock += "\n\n【世界观】\n" + subWorld.map((w: any) => `- [${w.category}] ${w.name}: ${w.description || ""}`).join("\n");
+            // 用户上传的素材 (对标书/参考资料): 只给索引, 正文让专家自己 read_source 翻页
+            const subSrcs = store.listSources(pid);
+            if (subSrcs.length) ctxBlock += "\n\n【素材库 (用户已上传, 用 read_source 读正文)】\n" + subSrcs.map((x) => `- 《${x.source}》 ${x.chars} 字`).join("\n");
             subMsgs.push({ role: "system", content: ctxBlock });
           }
           const proj0 = store.getProject(pid);
@@ -3002,7 +3310,7 @@ export async function runAgentLoop(state: RunState): Promise<string> {
 若某工具因缺少前置数据而失败 (例如没有大纲), 就用现有上下文自行补齐最小前置再继续, 或如实说明卡在哪一步。${targetAgent === "character-designer" ? `
 【建档专项】本任务涉及角色/设定归档, 侧边栏"设定集"只认 add_element 落库的数据:
 1) 每个角色必须调 manage_character(action=add, ...) 建档案;
-2) 每条设定 (角色/世界观/力量体系/金手指/境界…) 必须逐条调 add_element(kind, name, detail) 写进设定集, kind 用 character/worldview/power_system 等;
+2) 每条设定 (角色/世界观/力量体系/金手指/境界…) 必须逐条调 add_element(kind, name, detail) 写进设定集, kind 只能取前端认得的这些: character(人物) / world(世界观·力量体系·境界·金手指) / plot(剧情爽点) / style(文风) / foreshadow(伏笔) / location(地点) / timeline(时间线);
 3) 回复里必须如实汇报"实际落库 N 条设定 + M 份角色档案"。
 只在正文里描述设定而不调 add_element = 没做, 终审会打回。` : ""}`
               : `执行 Step ${phaseNum} (${PHASES[phaseNum as 1|2|3|4|5|6|7|8].name})。用户原文: ${userText.slice(0, 500)}`;
@@ -3056,6 +3364,9 @@ export async function runAgentLoop(state: RunState): Promise<string> {
             if ((evt.type === "step" || evt.type === "observation") && t) subToolsUsed.add(t);
             emit(evt);
           };
+          // 落库基线: 子 agent 跑完后用它判断"到底有没有真的写进设定集"
+          const elBeforeSub = store.listElements(pid).length;
+          const prBeforeSub = store.listCharacterProfiles(pid).length;
           const subLoopPromise = runAgentLoop({
             pid, agentName: targetAgent, messages: subMsgsProbe,
             depth: depth + 1, runId: subRunId, delegationLog: state.delegationLog, emit: subEmit,
@@ -3065,6 +3376,20 @@ export async function runAgentLoop(state: RunState): Promise<string> {
           );
           const llmResult = await Promise.race([subLoopPromise, timeoutPromise]);
           if (llmResult.trim()) subResult = subResult + "\n\n【子agent LLM 汇报】\n" + llmResult;
+          // === 设定落库保底 (2026-10-18 用户实测) ===
+          // 症状: 总编说"全部归拢进设定集", 角色师只回一段话, 一个 add_element 都没调,
+          //       侧边栏设定集永远是 0 条 —— 用户连问三遍"加入到设定集里面", 每次都是口头应承。
+          // 对策: 设定集不能靠专家 LLM 自觉。跑完发现元素/档案数没变, 就由代码层直接从
+          //       已敲定的对话里抽设定、逐条落库, 并如实标注"这是系统保底写入"。
+          if (targetAgent === "character-designer"
+              && store.listElements(pid).length === elBeforeSub
+              && store.listCharacterProfiles(pid).length === prBeforeSub) {
+            const persist = await ensureSettingsPersisted(pid, subEmit, subResult + (llmResult ? "\n" + llmResult : ""));
+            if (persist.added || persist.profiles) {
+              subResult = (subResult.trim() ? subResult + "\n\n" : "") + persist.summary;
+              subToolsUsed.add("add_element");
+            }
+          }
           // LLM 在预算内没出结果 → 立刻用代跑结果出卡片 (sub_answer), 不再等
           // 429/限流时 LLM 子循环会熔断, 这里立即用代跑结果快出, 不卡 15s
           if (!llmResult.trim()) {
@@ -3191,6 +3516,7 @@ export async function runAgentLoop(state: RunState): Promise<string> {
 
       for (const tc of nativeToolCalls) {
         emit({ type: "step", agent: agentName, tool: tc.name, args: tc.arguments });
+        state.toolCallsExecuted = (state.toolCallsExecuted || 0) + 1;
         const toolKey = `${tc.name}:${JSON.stringify(tc.arguments)}`;
         loopDetect[toolKey] = (loopDetect[toolKey] || 0) + 1;
         if (loopDetect[toolKey] >= s.loopDetectCount) {
@@ -3250,6 +3576,9 @@ export async function runAgentLoop(state: RunState): Promise<string> {
             if (subProfiles.length) ctxBlock += "\n\n【角色档案】\n" + subProfiles.map((p: any) => `- ${p.name}(${p.role || "?"}): ${p.personality || ""}`).join("\n");
             const subWorld = store.listWorldEntries(pid);
             if (subWorld.length) ctxBlock += "\n\n【世界观】\n" + subWorld.map((w: any) => `- [${w.category}] ${w.name}: ${w.description || ""}`).join("\n");
+            // 用户上传的素材 (对标书/参考资料): 只给索引, 正文让专家自己 read_source 翻页
+            const subSrcs = store.listSources(pid);
+            if (subSrcs.length) ctxBlock += "\n\n【素材库 (用户已上传, 用 read_source 读正文)】\n" + subSrcs.map((x) => `- 《${x.source}》 ${x.chars} 字`).join("\n");
             subMsgs.push({ role: "system", content: ctxBlock });
           }
           subMsgs.push({ role: "user", content: task });
@@ -3361,6 +3690,8 @@ export async function runAgentLoop(state: RunState): Promise<string> {
       // 收尾轮已消费 (无论是否兜底), 清除标记, 不污染后续轮
       if (closingRound) state.pendingDelegationReport = false;
        if (!finalContent) {
+        // 非流式回退是否救回来了 (正文 / 工具调用) —— 救回来就不能再走"空回复"处理
+        let fbRecovered = false;
         // 借鉴 DSH dsh-llm-deepseek L1206: stop 终止 + 0 内容块 = 空响应, 当作"失败"重试, 不当"模型沉默"。
         // tianyan 自己的写法: 每次重试前改一下 messages (注入变化提示), 打破"同输入→同空输出"的循环。
         consecutiveEmptyCount++;
@@ -3419,11 +3750,13 @@ export async function runAgentLoop(state: RunState): Promise<string> {
                 emit({ type: "think_end", agent: agentName, feasible: true, reason: "非流式回退完成(真实reasoning)", plan: [], missing: "" });
                 thinkingText = fbReasoning; // 真实推理落库, 切会话后思考面板仍能恢复
               }
+              fbRecovered = true; // 非流式救回了正文 → 本轮直接当最终答复, 不再走"空回复"处理
             } else if (fbToolCalls.length > 0) {
-              nativeToolCalls = fbToolCalls;
+              // 工具调用交给下一轮直接执行 (carryToolCalls) —— 旧代码塞进本轮 nativeToolCalls
+              // 后又 continue 掉, 结果"模型选了工具但一个都没跑"
+              carryToolCalls = fbToolCalls;
               consecutiveEmptyCount = 0;
-              // tool_calls 路径: 撤回提示, 走下方 toolCall 处理
-              messages.pop();
+              messages.pop(); // 撤回 "[系统: 上一轮内容为空]" 提示
               // 路线A: 非流式回退 tool_calls 路径 — 不合成假思考, 诚实标注真实工具决策
               if (!thinkDone) {
                 const honestFb = `模型本轮选择调用工具: ${fbToolCalls.map(t => t.name).join(", ")} (非流式回退, 未开启 reasoning 通道, 此为真实工具决策映射, 非合成分析)`;
@@ -3432,6 +3765,7 @@ export async function runAgentLoop(state: RunState): Promise<string> {
                 emit({ type: "think_end", agent: agentName, feasible: true, reason: "非流式回退·工具决策(真实映射)", plan: [], missing: "" });
                 thinkingText = honestFb;
               }
+              continue; // 下一轮带着 carryToolCalls 直接执行, 不再重走流式
             } else {
               // 非流式也空 → 继续空回复计数 (走下方 >=5 放弃 或 继续重试)
             }
@@ -3440,6 +3774,10 @@ export async function runAgentLoop(state: RunState): Promise<string> {
             emit({ type: "observation", agent: agentName, tool: "fallback_nonstream", result: `非流式回退也失败: ${(fbErr as Error).message}` });
           }
         }
+        if (fbRecovered) {
+          // 非流式回退拿到了正文: 直接当作本轮最终答复, 跳过下面整段"空回复"处理
+          finalContent = fullContent;
+        } else {
         // 超过3次空回复 (非流式也没拿到内容) → 借鉴 Hermes empty_response_guard 的 fallback 阶梯:
         // 当前模型反复空 = 该模型不适合, 自动切到候选模型重试 (agnes-3.0 反复空 → agnes-2.5 直接出正文)
         if (consecutiveEmptyCount >= 3) {          const s2 = getSettings();
@@ -3469,6 +3807,31 @@ export async function runAgentLoop(state: RunState): Promise<string> {
         }
         emit({ type: "observation", agent: agentName, tool: "empty_response", result: `LLM 返回空内容, 已注入重试提示, 重试中... (${consecutiveEmptyCount}/5)` });
         continue;
+        } // end !fbRecovered
+      }
+      // === 收尾落库闸门 (2026-10-18 用户实测) ===
+      // 症状: 用户说"加入到设定集里", 总编回一句"好的, 我这就把所有敲定的设定统一写进设定集…"
+      //       然后直接收工 —— 本轮 0 个工具调用、0 条元素, 侧边栏设定集还是 0。连问三次都一样。
+      // 原则: 答复里可以写"已落库", 但库里必须有东西。收尾前做一次事实核查: 用户要写、本轮却
+      //       一个工具都没调, 就由代码层抽设定补写, 再把真实结果追加进答复, 不让空话出门。
+      if (agentName === "orchestrator" && depth === 0
+          && (state.toolCallsExecuted || 0) === 0 && !state.orchestratorDelegated) {
+        const lastUser = [...messages].reverse()
+          .find((m) => m.role === "user" && !String(m.content || "").startsWith("[系统"));
+        const userText = String(lastUser?.content || "").trim();
+        const mentionsSetting = /(设定集|设定|档案|人设|世界观|金手指|境界|大纲)/.test(userText);
+        const wantsPersist = mentionsSetting && /(加入|加进|放进|归拢|写入|写进|落库|保存|建档|整理|汇总|存进)/.test(userText);
+        const claimsPersist = /(写进设定集|加入设定集|写入设定集|落库|归拢|建档|已归档|已保存)/.test(finalContent);
+        if (wantsPersist || claimsPersist) {
+          const persist = await ensureSettingsPersisted(pid, emit, finalContent);
+          if (persist.added || persist.profiles) {
+            const extra = "\n\n" + persist.summary;
+            finalContent += extra;
+            emit({ type: "token", agent: agentName, content: extra });
+          } else {
+            logWarn("[收尾闸门] 用户要求落库设定, 但本轮 0 工具且抽取无结果, 答复保持原样");
+          }
+        }
       }
       // 存储最终回答
       store.addMessage(pid, "assistant", finalContent);
@@ -3481,6 +3844,7 @@ export async function runAgentLoop(state: RunState): Promise<string> {
 
     const { tool: toolName, args: toolArgs } = toolCall;
     emit({ type: "step", agent: agentName, tool: toolName, args: toolArgs });
+    state.toolCallsExecuted = (state.toolCallsExecuted || 0) + 1;
 
     // 循环检测
     const key = `${toolName}:${JSON.stringify(toolArgs)}`;
@@ -3545,6 +3909,10 @@ export async function runAgentLoop(state: RunState): Promise<string> {
         const subWorld = store.listWorldEntries(pid);
         if (subWorld.length) {
           ctxBlock += "\n\n【世界观】\n" + subWorld.map(w => `- [${w.category}] ${w.name}: ${w.description || ""}`).join("\n");
+        }
+        const subSrcs = store.listSources(pid);
+        if (subSrcs.length) {
+          ctxBlock += "\n\n【素材库 (用户已上传, 用 read_source 读正文)】\n" + subSrcs.map(x => `- 《${x.source}》 ${x.chars} 字`).join("\n");
         }
         // 注入章节大纲
         const subChapters = store.listChapters(pid);

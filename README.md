@@ -1,5 +1,5 @@
 # 天衍 (Tianyan)
-> 注：本代码同时以 **AGPL-3.0** 和 **GPL-3.0** 双许可发布，用户可任选其一 (AGPL 见 `LICENSE`，GPL 见 `LICENSE_GNU_3 .0
+> 注：本代码同时以 **AGPL-3.0** 和 **GPL-3.0** 双许可发布，用户可任选其一 (AGPL 见 `LICENSE`，GPL 见 `LICENSE_GNU_3 .0）
 一个多Agent协同的**天衍**(Web 界面)。7 个 agent 协同,按 7 步流水线完成从扫榜调研到定稿交付的完整长篇创作闭环,内置「毒舌总编」审稿机制与质检打回循环。
 
 **7 个 Agent 协同**，按强制流水线完成从扫榜调研到定稿交付的完整长篇创作闭环，内置「毒舌总编」审稿机制、36 维质检打回循环(含第 36 维原创度检测)、真实浏览器扫榜。
@@ -120,7 +120,7 @@ bash tianyan.sh           # 或 Windows: tianyan.bat
 ### 一键启动（推荐）
 
 ```bash
-git clone https://github.com/l1064709321/tianyan.git
+git clone https://github.com/y1064709321/tianyan.git
 cd tianyan
 
 # Linux / macOS
@@ -317,11 +317,14 @@ Scrapling 为 BSD-3-Clause（宽松型，无 copyleft 传染）：合入后组�
 
 ```bash
 # 1. 克隆
-git clone https://github.com/l1064709321/tianyan.git
+git clone https://github.com/y1064709321/tianyan.git
 cd tianyan
+# 2. 一键启动 (Linux/macOS)
+tianyan.sh
+# 或
+tianyan.bat (Windows)
 
-# 2. 一键启动 (Linux/macOS)  或  tianyan.bat (Windows)
-bash tianyan.sh
+ 
 ```
 
 **`bash tianyan.sh` 内部自动做的事**（你不用手动执行）：

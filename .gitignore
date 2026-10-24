@@ -20,3 +20,13 @@ preview_screenshots/
 config.yaml
 .workbuddy/
 .workbuddy-ai/
+PROGRESS.md
+
+# 本地临时验证脚本与抓包日志 (含项目内容, 不上传)
+.fix-verify/
+.audit-data/
+.verify-data/
+
+# 密钥配置文件
+.env
+.env.local
